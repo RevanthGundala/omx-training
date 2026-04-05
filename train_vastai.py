@@ -36,14 +36,18 @@ set -e
 
 echo "=== OMX ACT Training on Vast.ai ==="
 
-# Clone repo and install
+# Install lerobot from ROBOTIS fork (has OMX support)
 cd /workspace
 git clone https://github.com/ROBOTIS-GIT/lerobot.git
 cd lerobot
 git checkout feature-omx-devel
 pip install -e ".[dynamixel]"
 
-# Login to HuggingFace
+# Clone our training scripts
+cd /workspace
+git clone https://github.com/RevanthGundala/omx-training.git
+
+# Login to HuggingFace (for private dataset)
 huggingface-cli login --token {hf_token}
 
 # Download dataset
@@ -53,151 +57,13 @@ ds = LeRobotDataset('{dataset_repo_id}')
 print(f'Dataset loaded: {{ds.num_episodes}} episodes, {{ds.num_frames}} frames')
 "
 
-# Write the training script
-cat > /workspace/train_act.py << 'TRAINEOF'
-import logging
-import time
-from contextlib import nullcontext
-from pathlib import Path
-
-import torch
-from torch.amp import GradScaler
-
-from lerobot.configs.default import DatasetConfig
-from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
-from lerobot.optim.factory import make_optimizer_and_scheduler
-from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.factory import make_policy
-from lerobot.policies.utils import get_device_from_parameters
-from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
-from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import save_checkpoint, get_step_checkpoint_dir, update_last_checkpoint
-from lerobot.utils.utils import get_safe_torch_device, has_method, format_big_number
-
-DATASET_REPO_ID = "{dataset_repo_id}"
-OUTPUT_DIR = Path("/workspace/outputs")
-DEVICE = "cuda"
-BATCH_SIZE = 8
-NUM_WORKERS = 4
-TRAINING_STEPS = {training_steps}
-LOG_FREQ = 100
-SAVE_FREQ = 10_000
-SEED = 1000
-CHUNK_SIZE = 100
-USE_VAE = True
-KL_WEIGHT = 10.0
-LEARNING_RATE = 1e-5
-
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
-    set_seed(SEED)
-
-    dataset_config = DatasetConfig(repo_id=DATASET_REPO_ID)
-    act_config = ACTConfig(
-        input_features={{}}, output_features={{}},
-        device=DEVICE, chunk_size=CHUNK_SIZE, n_action_steps=CHUNK_SIZE,
-        use_vae=USE_VAE, kl_weight=KL_WEIGHT,
-        optimizer_lr=LEARNING_RATE, optimizer_lr_backbone=LEARNING_RATE,
-        vision_backbone="resnet18",
-    )
-    train_cfg = TrainPipelineConfig(
-        dataset=dataset_config, policy=act_config, output_dir=OUTPUT_DIR,
-        batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, steps=TRAINING_STEPS,
-        log_freq=LOG_FREQ, save_freq=SAVE_FREQ, seed=SEED, eval_freq=-1,
-    )
-    train_cfg.validate()
-
-    device = get_safe_torch_device(DEVICE, log=True)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    logging.info(f"Loading dataset: {{DATASET_REPO_ID}}")
-    dataset = make_dataset(train_cfg)
-    logging.info(f"  Episodes: {{dataset.num_episodes}}, Frames: {{dataset.num_frames}}")
-
-    logging.info("Creating ACT policy")
-    policy = make_policy(cfg=train_cfg.policy, ds_meta=dataset.meta)
-    policy.train()
-    num_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    logging.info(f"  Learnable parameters: {{format_big_number(num_params)}}")
-
-    optimizer, lr_scheduler = make_optimizer_and_scheduler(train_cfg, policy)
-    grad_scaler = GradScaler(device.type, enabled=act_config.use_amp)
-
-    if hasattr(train_cfg.policy, "drop_n_last_frames"):
-        sampler = EpisodeAwareSampler(dataset.episode_data_index, drop_n_last_frames=train_cfg.policy.drop_n_last_frames, shuffle=True)
-        shuffle = False
-    else:
-        sampler = None
-        shuffle = True
-
-    dataloader = torch.utils.data.DataLoader(dataset, num_workers=NUM_WORKERS, batch_size=BATCH_SIZE, shuffle=shuffle, sampler=sampler, pin_memory=True, drop_last=False)
-    dl_iter = cycle(dataloader)
-
-    train_metrics = {{
-        "loss": AverageMeter("loss", ":.3f"),
-        "grad_norm": AverageMeter("grdn", ":.3f"),
-        "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
-        "dataloading_s": AverageMeter("data_s", ":.3f"),
-    }}
-    train_tracker = MetricsTracker(BATCH_SIZE, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=0)
-
-    logging.info(f"Starting training for {{TRAINING_STEPS}} steps on {{device}}...")
-    for step in range(1, TRAINING_STEPS + 1):
-        start_time = time.perf_counter()
-        batch = next(dl_iter)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
-
-        for key in batch:
-            if isinstance(batch[key], torch.Tensor):
-                batch[key] = batch[key].to(device, non_blocking=True)
-
-        start_time = time.perf_counter()
-        with torch.autocast(device_type=device.type) if act_config.use_amp else nullcontext():
-            loss, output_dict = policy.forward(batch)
-        grad_scaler.scale(loss).backward()
-        grad_scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), train_cfg.optimizer.grad_clip_norm, error_if_nonfinite=False)
-        grad_scaler.step(optimizer)
-        grad_scaler.update()
-        optimizer.zero_grad()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
-        if has_method(policy, "update"):
-            policy.update()
-
-        train_tracker.loss = loss.item()
-        train_tracker.grad_norm = grad_norm.item()
-        train_tracker.lr = optimizer.param_groups[0]["lr"]
-        train_tracker.update_s = time.perf_counter() - start_time
-        train_tracker.step()
-
-        if step % LOG_FREQ == 0:
-            logging.info(train_tracker)
-            train_tracker.reset_averages()
-        if step % SAVE_FREQ == 0 or step == TRAINING_STEPS:
-            logging.info(f"Saving checkpoint at step {{step}}")
-            checkpoint_dir = get_step_checkpoint_dir(OUTPUT_DIR, TRAINING_STEPS, step)
-            save_checkpoint(checkpoint_dir, step, train_cfg, policy, optimizer, lr_scheduler)
-            update_last_checkpoint(checkpoint_dir)
-
-    logging.info(f"Training complete! Checkpoints at {{OUTPUT_DIR}}")
-
-if __name__ == "__main__":
-    main()
-TRAINEOF
-
 # Run training
-cd /workspace/lerobot
 echo "=== Starting ACT training ==="
-python /workspace/train_act.py
+cd /workspace/omx-training
+python train.py
 
 echo "=== TRAINING COMPLETE ==="
-echo "Checkpoints saved to /workspace/outputs/"
+echo "Checkpoints saved to /workspace/omx-training/omx_scripts/outputs/"
 '''
 
 
