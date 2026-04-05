@@ -1,0 +1,9 @@
+# Ignore
+__pycache__/
+*.pyc
+.DS_Store
+outputs/
+episodes_h264/
+*.mp4
+*.png
+.venv/

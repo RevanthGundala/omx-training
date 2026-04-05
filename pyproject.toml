@@ -1,0 +1,15 @@
+[project]
+name = "omx-training"
+version = "0.1.0"
+description = "OMX robot arm training scripts using LeRobot"
+requires-python = ">=3.10"
+dependencies = [
+    "lerobot @ git+https://github.com/ROBOTIS-GIT/lerobot.git@feature-omx-devel",
+    "rerun-sdk>=0.22",
+    "pynput>=1.7",
+    "vastai-sdk>=0.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
