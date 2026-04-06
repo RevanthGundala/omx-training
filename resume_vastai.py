@@ -80,8 +80,12 @@ def main():
             vast.attach_ssh(instance_id=INSTANCE_ID, ssh_key=pubkey)
             print("🔑 SSH key attached to instance")
 
-        # ── 1. Download dataset ──
-        print(f"📦 Downloading dataset on instance {INSTANCE_ID}...")
+        # ── 1. Fix huggingface-hub version + download dataset ──
+        print(f"📦 Fixing deps and downloading dataset on instance {INSTANCE_ID}...")
+        vast.execute(
+            id=INSTANCE_ID,
+            COMMAND='pip install "huggingface-hub<1.0" -q',
+        )
         result = vast.execute(
             id=INSTANCE_ID,
             COMMAND=f'export HF_TOKEN="{HF_TOKEN}" && python -c "'

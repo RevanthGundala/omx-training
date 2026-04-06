@@ -66,6 +66,7 @@ git clone https://github.com/ROBOTIS-GIT/lerobot.git
 cd lerobot
 git checkout feature-omx-devel
 pip install -e ".[dynamixel]"
+pip install "huggingface-hub<1.0"
 
 # Make HF token available to Python libraries
 export HF_TOKEN="{hf_token}"
