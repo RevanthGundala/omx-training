@@ -104,20 +104,23 @@ def _wait_for_instance(vast, instance_id):
     else:
         raise TimeoutError(f"Instance not running after {BOOT_TIMEOUT}s")
 
-    # Phase 2: wait for setup script to finish (separate timeout)
-    print("⏳ Waiting for dependency install + dataset download (this takes ~10-15 min)...")
+    # Phase 2: stream setup logs until complete (separate timeout)
+    print("⏳ Installing deps + downloading dataset (this takes ~10-15 min)...\n")
     start = time.time()
+    seen_lines = set()
     while time.time() - start < SETUP_TIMEOUT:
         try:
-            logs = vast.logs(INSTANCE_ID=instance_id, tail="20")
+            logs = vast.logs(INSTANCE_ID=instance_id, tail="50")
             logs_str = logs if isinstance(logs, str) else str(logs)
+
+            for line in logs_str.splitlines():
+                if line and line not in seen_lines:
+                    seen_lines.add(line)
+                    print(f"  [setup] {line}")
+
             if "SETUP COMPLETE" in logs_str:
-                print(f"✅ Setup complete! ({int(time.time() - start)}s)")
+                print(f"\n✅ Setup complete! ({int(time.time() - start)}s)")
                 return
-            # Show progress from the last log line
-            lines = [l.strip() for l in logs_str.splitlines() if l.strip()]
-            if lines:
-                print(f"   [{int(time.time() - start)}s] {lines[-1][:100]}")
         except Exception as e:
             print(f"   Log check error: {e}")
         time.sleep(POLL_INTERVAL)
