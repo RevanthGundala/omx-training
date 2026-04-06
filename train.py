@@ -95,7 +95,15 @@ def main():
 
     # ── 3. Load dataset ──
     logging.info(f"Loading dataset: {DATASET_REPO_ID}")
-    dataset = make_dataset(train_cfg)
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.datasets.factory import resolve_delta_timestamps
+    ds_meta = LeRobotDatasetMetadata(DATASET_REPO_ID)
+    delta_timestamps = resolve_delta_timestamps(train_cfg.policy, ds_meta)
+    dataset = LeRobotDataset(
+        DATASET_REPO_ID,
+        delta_timestamps=delta_timestamps,
+        tolerance_s=1e4,  # recording has uneven frame timing between episodes
+    )
     logging.info(f"  Episodes: {dataset.num_episodes}")
     logging.info(f"  Frames:   {dataset.num_frames}")
 
