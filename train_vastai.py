@@ -43,7 +43,6 @@ HF_TOKEN = _get_hf_token()
 DATASET_REPO_ID = "RevanthGundala/pick_up_packet_test"
 GPU_NAME = "RTX_4090"
 DISK_GB = 40
-TRAINING_STEPS = 50_000
 
 POLL_INTERVAL = 15  # seconds between status checks
 SETUP_TIMEOUT = 600  # max seconds to wait for instance setup
@@ -122,17 +121,20 @@ def _wait_for_instance(vast, instance_id, timeout=SETUP_TIMEOUT):
 
 
 def _stream_logs(vast, instance_id):
-    """Stream logs until training completes or fails."""
+    """Stream training logs from the remote log file until training completes."""
     print("\n📋 Streaming training logs...\n")
     seen_lines = set()
 
     while True:
         try:
-            logs = vast.logs(INSTANCE_ID=instance_id, tail="50")
-            logs_str = logs if isinstance(logs, str) else str(logs)
+            result = vast.execute(
+                id=instance_id,
+                COMMAND="tail -n 50 /workspace/train.log 2>/dev/null || echo 'Waiting for training output...'",
+            )
+            logs_str = result if isinstance(result, str) else str(result)
 
             for line in logs_str.splitlines():
-                if line not in seen_lines:
+                if line and line not in seen_lines:
                     seen_lines.add(line)
                     print(f"  [remote] {line}")
 
@@ -152,7 +154,8 @@ def main():
         sys.exit(1)
     if not HF_TOKEN:
         print("ERROR: HF_TOKEN not set.")
-        print("  export HF_TOKEN='your-token'  # from https://huggingface.co/settings/tokens")
+        print("  Run: huggingface-cli login")
+        print("  Or:  export HF_TOKEN='your-token'  # from https://huggingface.co/settings/tokens")
         sys.exit(1)
 
     vast = VastAI(api_key=VASTAI_API_KEY)
@@ -206,7 +209,7 @@ def main():
         print("🏋️ Starting training...")
         vast.execute(
             id=instance_id,
-            COMMAND="cd /workspace && nohup python train.py > /workspace/train.log 2>&1 &",
+            COMMAND='cd /workspace && nohup bash -c \'python train.py 2>&1; echo "=== TRAINING COMPLETE ==="\' > /workspace/train.log 2>&1 &',
         )
 
         # ── 5. Stream logs ──
