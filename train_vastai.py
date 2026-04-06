@@ -3,15 +3,15 @@ train_vastai.py — Launch ACT training on a Vast.ai RTX 4090 from your Mac.
 
 This script:
   1. Finds the cheapest RTX 4090 on Vast.ai
-  2. Launches it with a PyTorch image and installs dependencies
-  3. Uploads train.py via the SDK (no git clone of this repo needed)
-  4. Runs training and streams logs to your terminal
-  5. Downloads the checkpoint and destroys the instance
+  2. Launches it with a PyTorch image
+  3. Installs deps, downloads dataset, and runs training (all in onstart)
+  4. Streams all logs to your terminal via vast.logs()
+  5. When done, prints download instructions and destroys the instance
 
 Usage:
   1. Export your API keys:
        export VASTAI_API_KEY="your-key"
-       export HF_TOKEN="your-token"
+       export HF_TOKEN="your-token"  (or run: huggingface-cli login)
   2. Run: uv run python train_vastai.py
 """
 
@@ -29,7 +29,6 @@ from vastai_sdk import VastAI
 # ──────────────────────────────────────────────
 VASTAI_API_KEY = os.environ.get("VASTAI_API_KEY", "")
 
-# Read HF token from env var, or fall back to local `hf auth login` cache
 def _get_hf_token():
     token = os.environ.get("HF_TOKEN", "")
     if token:
@@ -47,11 +46,16 @@ DISK_GB = 40
 
 POLL_INTERVAL = 15  # seconds between status checks
 BOOT_TIMEOUT = 600  # max seconds to wait for instance to start running
-SETUP_TIMEOUT = 1200  # max seconds to wait for dep install + dataset download
-LOG_POLL_INTERVAL = 30  # seconds between log checks during training
+LOG_POLL_INTERVAL = 30  # seconds between log checks
 
-# Onstart script: install deps + download dataset only (no training, no repo clone)
-SETUP_SCRIPT = r'''#!/bin/bash
+
+def _build_onstart_script(train_py_b64: str) -> str:
+    """Build the onstart script that runs setup + training in one shot.
+
+    Everything runs as the main container process, so all output
+    naturally appears in vast.logs() and the Vast.ai dashboard.
+    """
+    return r'''#!/bin/bash
 set -e
 
 echo "=== Setting up OMX training environment ==="
@@ -64,7 +68,7 @@ git checkout feature-omx-devel
 pip install -e ".[dynamixel]"
 
 # Make HF token available to Python libraries
-export HF_TOKEN={hf_token}
+export HF_TOKEN="{hf_token}"
 
 # Download dataset
 python -c "
@@ -74,8 +78,19 @@ print(f'Dataset loaded: {{ds.num_episodes}} episodes, {{ds.num_frames}} frames')
 "
 
 echo "=== SETUP COMPLETE ==="
-touch /workspace/.setup_done
-'''
+
+# Decode and run train.py (embedded as base64, no git clone needed)
+cd /workspace
+echo "{train_py_b64}" | base64 -d > train.py
+echo "=== Starting ACT training ==="
+python train.py
+
+echo "=== TRAINING COMPLETE ==="
+'''.format(
+        hf_token=HF_TOKEN,
+        dataset_repo_id=DATASET_REPO_ID,
+        train_py_b64=train_py_b64,
+    )
 
 
 def _parse_instance_id(result):
@@ -86,52 +101,9 @@ def _parse_instance_id(result):
     return None
 
 
-def _wait_for_instance(vast, instance_id):
-    """Poll until the instance is running and setup is complete."""
-    # Phase 1: wait for instance status to be "running"
-    print("⏳ Waiting for instance to boot...")
-    start = time.time()
-    while time.time() - start < BOOT_TIMEOUT:
-        try:
-            info = vast.show_instance(id=instance_id)
-            data = json.loads(info) if isinstance(info, str) else info
-            status = data.get("actual_status", data.get("status_msg", "unknown"))
-            print(f"   Status: {status} ({int(time.time() - start)}s elapsed)")
-            if status == "running":
-                break
-        except Exception as e:
-            print(f"   Polling error: {e}")
-        time.sleep(POLL_INTERVAL)
-    else:
-        raise TimeoutError(f"Instance not running after {BOOT_TIMEOUT}s")
-
-    # Phase 2: stream setup logs until complete (separate timeout)
-    print("⏳ Installing deps + downloading dataset (this takes ~10-15 min)...\n")
-    start = time.time()
-    seen_lines = set()
-    while time.time() - start < SETUP_TIMEOUT:
-        try:
-            logs = vast.logs(INSTANCE_ID=instance_id, tail="50")
-            logs_str = logs if isinstance(logs, str) else str(logs)
-
-            for line in logs_str.splitlines():
-                if line and line not in seen_lines:
-                    seen_lines.add(line)
-                    print(f"  [setup] {line}")
-
-            if "SETUP COMPLETE" in logs_str:
-                print(f"\n✅ Setup complete! ({int(time.time() - start)}s)")
-                return
-        except Exception as e:
-            print(f"   Log check error: {e}")
-        time.sleep(POLL_INTERVAL)
-
-    raise TimeoutError(f"Setup did not complete within {SETUP_TIMEOUT}s")
-
-
 def _stream_logs(vast, instance_id):
-    """Stream training logs from container stdout until training completes."""
-    print("\n📋 Streaming training logs...\n")
+    """Stream container logs until training completes."""
+    print("\n📋 Streaming logs (setup + training)...\n")
     seen_lines = set()
 
     while True:
@@ -164,17 +136,21 @@ def main():
         print("  Or:  export HF_TOKEN='your-token'  # from https://huggingface.co/settings/tokens")
         sys.exit(1)
 
+    # Embed train.py as base64
+    train_py = Path(__file__).parent / "train.py"
+    if not train_py.exists():
+        print(f"❌ train.py not found at {train_py}")
+        sys.exit(1)
+    train_py_b64 = base64.b64encode(train_py.read_bytes()).decode()
+
     vast = VastAI(api_key=VASTAI_API_KEY)
     instance_id = None
 
     try:
-        # ── 1. Launch instance (setup only, no training) ──
+        # ── 1. Launch instance ──
         print(f"🔍 Searching for cheapest {GPU_NAME}...")
 
-        onstart = SETUP_SCRIPT.format(
-            hf_token=HF_TOKEN,
-            dataset_repo_id=DATASET_REPO_ID,
-        )
+        onstart = _build_onstart_script(train_py_b64)
 
         print(f"🚀 Launching {GPU_NAME} instance...")
         result = vast.launch_instance(
@@ -204,34 +180,27 @@ def main():
             vast.attach_ssh(instance_id=instance_id, ssh_key=pubkey)
             print("🔑 SSH key attached to instance")
 
-        # ── 3. Wait for instance + setup ──
-        _wait_for_instance(vast, instance_id)
+        # ── 3. Wait for boot ──
+        print("⏳ Waiting for instance to boot...")
+        start = time.time()
+        while time.time() - start < BOOT_TIMEOUT:
+            try:
+                info = vast.show_instance(id=instance_id)
+                data = json.loads(info) if isinstance(info, str) else info
+                status = data.get("actual_status", data.get("status_msg", "unknown"))
+                print(f"   Status: {status} ({int(time.time() - start)}s elapsed)")
+                if status == "running":
+                    break
+            except Exception as e:
+                print(f"   Polling error: {e}")
+            time.sleep(POLL_INTERVAL)
+        else:
+            raise TimeoutError(f"Instance not running after {BOOT_TIMEOUT}s")
 
-        # ── 3. Upload train.py ──
-        print("📤 Uploading train.py to instance...")
-        train_py = Path(__file__).parent / "train.py"
-        if not train_py.exists():
-            print(f"❌ train.py not found at {train_py}")
-            sys.exit(1)
-
-        encoded = base64.b64encode(train_py.read_bytes()).decode()
-        vast.execute(
-            id=instance_id,
-            COMMAND=f'echo "{encoded}" | base64 -d > /workspace/train.py',
-        )
-        print("✅ train.py uploaded!")
-
-        # ── 4. Start training ──
-        print("🏋️ Starting training...")
-        vast.execute(
-            id=instance_id,
-            COMMAND='cd /workspace && nohup bash -c \'export HF_TOKEN="' + HF_TOKEN + '" && python train.py 2>&1; echo "=== TRAINING COMPLETE ==="\' | tee /workspace/train.log > /proc/1/fd/1 2>&1 &',
-        )
-
-        # ── 5. Stream logs ──
+        # ── 4. Stream all logs (setup + training) ──
         _stream_logs(vast, instance_id)
 
-        # ── 6. Download checkpoints ──
+        # ── 5. Download checkpoints ──
         print("\n📥 Getting SCP URL for checkpoint download...")
         scp_info = vast.scp_url(id=instance_id)
         print(f"   {scp_info}")
@@ -239,14 +208,13 @@ def main():
         output_dir = Path(__file__).parent / "outputs"
         output_dir.mkdir(exist_ok=True)
         print(f"\n   To download checkpoints, run:")
-        print(f"   scp -r <instance>:/workspace/omx_scripts/outputs/ {output_dir}/")
+        print(f"   scp -r <instance>:/workspace/outputs/ {output_dir}/")
 
     except KeyboardInterrupt:
         print("\n\n⚠️  Interrupted by user.")
     except Exception as e:
         print(f"\n❌ Error: {e}")
     finally:
-        # ── 7. Destroy instance ──
         if instance_id:
             print(f"\n🗑️  Destroying instance {instance_id}...")
             try:
