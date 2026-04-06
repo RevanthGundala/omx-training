@@ -45,7 +45,8 @@ GPU_NAME = "RTX_4090"
 DISK_GB = 40
 
 POLL_INTERVAL = 15  # seconds between status checks
-SETUP_TIMEOUT = 600  # max seconds to wait for instance setup
+BOOT_TIMEOUT = 600  # max seconds to wait for instance to start running
+SETUP_TIMEOUT = 1200  # max seconds to wait for dep install + dataset download
 LOG_POLL_INTERVAL = 30  # seconds between log checks during training
 
 # Onstart script: install deps + download dataset only (no training, no repo clone)
@@ -84,13 +85,12 @@ def _parse_instance_id(result):
     return None
 
 
-def _wait_for_instance(vast, instance_id, timeout=SETUP_TIMEOUT):
+def _wait_for_instance(vast, instance_id):
     """Poll until the instance is running and setup is complete."""
-    print("⏳ Waiting for instance to be ready...")
-    start = time.time()
-
     # Phase 1: wait for instance status to be "running"
-    while time.time() - start < timeout:
+    print("⏳ Waiting for instance to boot...")
+    start = time.time()
+    while time.time() - start < BOOT_TIMEOUT:
         try:
             info = vast.show_instance(id=instance_id)
             data = json.loads(info) if isinstance(info, str) else info
@@ -102,22 +102,27 @@ def _wait_for_instance(vast, instance_id, timeout=SETUP_TIMEOUT):
             print(f"   Polling error: {e}")
         time.sleep(POLL_INTERVAL)
     else:
-        raise TimeoutError(f"Instance not running after {timeout}s")
+        raise TimeoutError(f"Instance not running after {BOOT_TIMEOUT}s")
 
-    # Phase 2: wait for setup script to finish (sentinel file)
-    print("⏳ Waiting for dependency setup to finish...")
-    while time.time() - start < timeout:
+    # Phase 2: wait for setup script to finish (separate timeout)
+    print("⏳ Waiting for dependency install + dataset download (this takes ~10-15 min)...")
+    start = time.time()
+    while time.time() - start < SETUP_TIMEOUT:
         try:
             logs = vast.logs(INSTANCE_ID=instance_id, tail="20")
             logs_str = logs if isinstance(logs, str) else str(logs)
             if "SETUP COMPLETE" in logs_str:
-                print("✅ Setup complete!")
+                print(f"✅ Setup complete! ({int(time.time() - start)}s)")
                 return
+            # Show progress from the last log line
+            lines = [l.strip() for l in logs_str.splitlines() if l.strip()]
+            if lines:
+                print(f"   [{int(time.time() - start)}s] {lines[-1][:100]}")
         except Exception as e:
             print(f"   Log check error: {e}")
         time.sleep(POLL_INTERVAL)
 
-    raise TimeoutError(f"Setup did not complete within {timeout}s")
+    raise TimeoutError(f"Setup did not complete within {SETUP_TIMEOUT}s")
 
 
 def _stream_logs(vast, instance_id):
