@@ -3,38 +3,46 @@ train_vastai.py — Launch ACT training on a Vast.ai RTX 4090 from your Mac.
 
 This script:
   1. Finds the cheapest RTX 4090 on Vast.ai
-  2. Launches it with a PyTorch image
-  3. Automatically clones the repo, installs deps, downloads dataset, and trains
-  4. You monitor logs from your Mac
-  5. When done, download the checkpoint and destroy the instance
+  2. Launches it with a PyTorch image and installs dependencies
+  3. Uploads train.py via the SDK (no git clone of this repo needed)
+  4. Runs training and streams logs to your terminal
+  5. Downloads the checkpoint and destroys the instance
 
 Usage:
-  1. Set your VASTAI_API_KEY and HF_TOKEN below
-  2. Run: uv run python omx_scripts/train_vastai.py
+  1. Export your API keys:
+       export VASTAI_API_KEY="your-key"
+       export HF_TOKEN="your-token"
+  2. Run: uv run python train_vastai.py
 """
 
 import json
-import time
+import os
 import sys
+import time
+from pathlib import Path
 
 from vastai_sdk import VastAI
 
 # ──────────────────────────────────────────────
 # Configuration — edit these
 # ──────────────────────────────────────────────
-VASTAI_API_KEY = "f0bb64e15db27a05b3b32317b77a5e10d4d78476186ea0bfd9be386821355f12"  # Get from https://cloud.vast.ai/account/
-HF_TOKEN = "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"  # Get from https://huggingface.co/settings/tokens
+VASTAI_API_KEY = os.environ.get("VASTAI_API_KEY", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 DATASET_REPO_ID = "RevanthGundala/pick_up_packet_test"
 GPU_NAME = "RTX_4090"
 DISK_GB = 40
 TRAINING_STEPS = 50_000
 
-# Training script that runs on the remote GPU instance
-REMOTE_TRAINING_SCRIPT = r'''#!/bin/bash
+POLL_INTERVAL = 15  # seconds between status checks
+SETUP_TIMEOUT = 600  # max seconds to wait for instance setup
+LOG_POLL_INTERVAL = 30  # seconds between log checks during training
+
+# Onstart script: install deps + download dataset only (no training, no repo clone)
+SETUP_SCRIPT = r'''#!/bin/bash
 set -e
 
-echo "=== OMX ACT Training on Vast.ai ==="
+echo "=== Setting up OMX training environment ==="
 
 # Install lerobot from ROBOTIS fork (has OMX support)
 cd /workspace
@@ -42,10 +50,6 @@ git clone https://github.com/ROBOTIS-GIT/lerobot.git
 cd lerobot
 git checkout feature-omx-devel
 pip install -e ".[dynamixel]"
-
-# Clone our training scripts
-cd /workspace
-git clone https://github.com/RevanthGundala/omx-training.git
 
 # Login to HuggingFace (for private dataset)
 huggingface-cli login --token {hf_token}
@@ -57,67 +61,170 @@ ds = LeRobotDataset('{dataset_repo_id}')
 print(f'Dataset loaded: {{ds.num_episodes}} episodes, {{ds.num_frames}} frames')
 "
 
-# Run training
-echo "=== Starting ACT training ==="
-cd /workspace/omx-training
-python train.py
-
-echo "=== TRAINING COMPLETE ==="
-echo "Checkpoints saved to /workspace/omx-training/omx_scripts/outputs/"
+echo "=== SETUP COMPLETE ==="
+touch /workspace/.setup_done
 '''
 
 
+def _parse_instance_id(result):
+    """Extract instance ID from launch_instance response."""
+    result_data = json.loads(result) if isinstance(result, str) else result
+    if isinstance(result_data, dict) and "new_contract" in result_data:
+        return result_data["new_contract"]
+    return None
+
+
+def _wait_for_instance(vast, instance_id, timeout=SETUP_TIMEOUT):
+    """Poll until the instance is running and setup is complete."""
+    print("⏳ Waiting for instance to be ready...")
+    start = time.time()
+
+    # Phase 1: wait for instance status to be "running"
+    while time.time() - start < timeout:
+        try:
+            info = vast.show_instance(id=instance_id)
+            data = json.loads(info) if isinstance(info, str) else info
+            status = data.get("actual_status", data.get("status_msg", "unknown"))
+            print(f"   Status: {status} ({int(time.time() - start)}s elapsed)")
+            if status == "running":
+                break
+        except Exception as e:
+            print(f"   Polling error: {e}")
+        time.sleep(POLL_INTERVAL)
+    else:
+        raise TimeoutError(f"Instance not running after {timeout}s")
+
+    # Phase 2: wait for setup script to finish (sentinel file)
+    print("⏳ Waiting for dependency setup to finish...")
+    while time.time() - start < timeout:
+        try:
+            logs = vast.logs(INSTANCE_ID=instance_id, tail="20")
+            logs_str = logs if isinstance(logs, str) else str(logs)
+            if "SETUP COMPLETE" in logs_str:
+                print("✅ Setup complete!")
+                return
+        except Exception as e:
+            print(f"   Log check error: {e}")
+        time.sleep(POLL_INTERVAL)
+
+    raise TimeoutError(f"Setup did not complete within {timeout}s")
+
+
+def _stream_logs(vast, instance_id):
+    """Stream logs until training completes or fails."""
+    print("\n📋 Streaming training logs...\n")
+    seen_lines = set()
+
+    while True:
+        try:
+            logs = vast.logs(INSTANCE_ID=instance_id, tail="50")
+            logs_str = logs if isinstance(logs, str) else str(logs)
+
+            for line in logs_str.splitlines():
+                if line not in seen_lines:
+                    seen_lines.add(line)
+                    print(f"  [remote] {line}")
+
+            if "TRAINING COMPLETE" in logs_str:
+                print("\n✅ Training finished!")
+                return True
+        except Exception as e:
+            print(f"  Log error: {e}")
+
+        time.sleep(LOG_POLL_INTERVAL)
+
+
 def main():
-    if VASTAI_API_KEY == "YOUR_VASTAI_API_KEY":
-        print("ERROR: Set your VASTAI_API_KEY at the top of this script.")
-        print("Get it from: https://cloud.vast.ai/account/")
+    if not VASTAI_API_KEY:
+        print("ERROR: VASTAI_API_KEY not set.")
+        print("  export VASTAI_API_KEY='your-key'  # from https://cloud.vast.ai/account/")
         sys.exit(1)
-    if HF_TOKEN == "YOUR_HF_TOKEN":
-        print("ERROR: Set your HF_TOKEN at the top of this script.")
-        print("Get it from: https://huggingface.co/settings/tokens")
+    if not HF_TOKEN:
+        print("ERROR: HF_TOKEN not set.")
+        print("  export HF_TOKEN='your-token'  # from https://huggingface.co/settings/tokens")
         sys.exit(1)
 
     vast = VastAI(api_key=VASTAI_API_KEY)
+    instance_id = None
 
-    # ── 1. Launch RTX 4090 instance ──
-    print(f"Searching for cheapest {GPU_NAME}...")
+    try:
+        # ── 1. Launch instance (setup only, no training) ──
+        print(f"🔍 Searching for cheapest {GPU_NAME}...")
 
-    onstart = REMOTE_TRAINING_SCRIPT.format(
-        hf_token=HF_TOKEN,
-        dataset_repo_id=DATASET_REPO_ID,
-        training_steps=TRAINING_STEPS,
-    )
+        onstart = SETUP_SCRIPT.format(
+            hf_token=HF_TOKEN,
+            dataset_repo_id=DATASET_REPO_ID,
+        )
 
-    print(f"Launching {GPU_NAME} instance...")
-    result = vast.launch_instance(
-        gpu_name=GPU_NAME,
-        num_gpus="1",
-        image="pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel",
-        disk=DISK_GB,
-        onstart_cmd=onstart,
-        ssh=True,
-        label="omx-act-training",
-    )
+        print(f"🚀 Launching {GPU_NAME} instance...")
+        result = vast.launch_instance(
+            gpu_name=GPU_NAME,
+            num_gpus="1",
+            image="pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel",
+            disk=DISK_GB,
+            onstart_cmd=onstart,
+            ssh=True,
+            label="omx-act-training",
+        )
 
-    # Parse instance ID from result
-    result_data = json.loads(result) if isinstance(result, str) else result
-    if isinstance(result_data, dict) and "new_contract" in result_data:
-        instance_id = result_data["new_contract"]
-    else:
-        print(f"Launch result: {result}")
-        print("Check https://cloud.vast.ai/instances/ for your instance.")
-        return
+        instance_id = _parse_instance_id(result)
+        if not instance_id:
+            print(f"❌ Failed to parse instance ID from: {result}")
+            sys.exit(1)
 
-    print(f"\n✅ Instance {instance_id} launched!")
-    print(f"Training will start automatically (~50 min for {TRAINING_STEPS} steps)")
-    print(f"\nMonitor at: https://cloud.vast.ai/instances/")
-    print(f"\nTo check logs:")
-    print(f"  uv run python -c \"from vastai_sdk import VastAI; v=VastAI(api_key='{VASTAI_API_KEY}'); print(v.logs({instance_id}))\"")
-    print(f"\nWhen training is done, download checkpoints:")
-    print(f"  uv run python -c \"from vastai_sdk import VastAI; v=VastAI(api_key='{VASTAI_API_KEY}'); print(v.scp_url({instance_id}))\"")
-    print(f"  # Then: scp -r <instance>:/workspace/outputs/ omx_scripts/outputs/")
-    print(f"\nTo destroy the instance when done:")
-    print(f"  uv run python -c \"from vastai_sdk import VastAI; v=VastAI(api_key='{VASTAI_API_KEY}'); v.destroy_instance(id={instance_id})\"")
+        print(f"✅ Instance {instance_id} launched!")
+        print(f"   Dashboard: https://cloud.vast.ai/instances/")
+
+        # ── 2. Wait for instance + setup ──
+        _wait_for_instance(vast, instance_id)
+
+        # ── 3. Upload train.py ──
+        print("📤 Uploading train.py to instance...")
+        train_py = Path(__file__).parent / "train.py"
+        if not train_py.exists():
+            print(f"❌ train.py not found at {train_py}")
+            sys.exit(1)
+
+        vast.copy(
+            src=str(train_py),
+            dst=f"{instance_id}:/workspace/train.py",
+        )
+        print("✅ train.py uploaded!")
+
+        # ── 4. Start training ──
+        print("🏋️ Starting training...")
+        vast.execute(
+            id=instance_id,
+            COMMAND="cd /workspace && nohup python train.py > /workspace/train.log 2>&1 &",
+        )
+
+        # ── 5. Stream logs ──
+        _stream_logs(vast, instance_id)
+
+        # ── 6. Download checkpoints ──
+        print("\n📥 Getting SCP URL for checkpoint download...")
+        scp_info = vast.scp_url(id=instance_id)
+        print(f"   {scp_info}")
+
+        output_dir = Path(__file__).parent / "outputs"
+        output_dir.mkdir(exist_ok=True)
+        print(f"\n   To download checkpoints, run:")
+        print(f"   scp -r <instance>:/workspace/omx_scripts/outputs/ {output_dir}/")
+
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted by user.")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    finally:
+        # ── 7. Destroy instance ──
+        if instance_id:
+            print(f"\n🗑️  Destroying instance {instance_id}...")
+            try:
+                vast.destroy_instance(id=instance_id)
+                print("✅ Instance destroyed.")
+            except Exception as e:
+                print(f"⚠️  Could not destroy instance: {e}")
+                print(f"   Destroy manually at https://cloud.vast.ai/instances/")
 
 
 if __name__ == "__main__":

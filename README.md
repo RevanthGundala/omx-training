@@ -54,9 +54,13 @@ python train.py
 Launch training on a Vast.ai RTX 4090 (~50 min, ~$0.40):
 
 ```bash
-# Set VASTAI_API_KEY and HF_TOKEN in the script first
+export VASTAI_API_KEY="your-key"  # from https://cloud.vast.ai/account/
+export HF_TOKEN="your-token"      # from https://huggingface.co/settings/tokens
 uv run python train_vastai.py
 ```
+
+The script automatically launches an instance, uploads `train.py`, runs
+training, streams logs, and destroys the instance when done.
 
 ## Configuration
 
