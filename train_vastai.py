@@ -195,7 +195,16 @@ def main():
         print(f"✅ Instance {instance_id} launched!")
         print(f"   Dashboard: https://cloud.vast.ai/instances/")
 
-        # ── 2. Wait for instance + setup ──
+        # ── 2. Attach SSH key ──
+        ssh_key_path = Path.home() / ".ssh" / "id_ed25519.pub"
+        if not ssh_key_path.exists():
+            ssh_key_path = Path.home() / ".ssh" / "id_rsa.pub"
+        if ssh_key_path.exists():
+            pubkey = ssh_key_path.read_text().strip()
+            vast.attach_ssh(instance_id=instance_id, ssh_key=pubkey)
+            print("🔑 SSH key attached to instance")
+
+        # ── 3. Wait for instance + setup ──
         _wait_for_instance(vast, instance_id)
 
         # ── 3. Upload train.py ──

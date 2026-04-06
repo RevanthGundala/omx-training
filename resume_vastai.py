@@ -71,6 +71,15 @@ def main():
     vast = VastAI(api_key=VASTAI_API_KEY)
 
     try:
+        # ── 0. Attach SSH key ──
+        ssh_key_path = Path.home() / ".ssh" / "id_ed25519.pub"
+        if not ssh_key_path.exists():
+            ssh_key_path = Path.home() / ".ssh" / "id_rsa.pub"
+        if ssh_key_path.exists():
+            pubkey = ssh_key_path.read_text().strip()
+            vast.attach_ssh(instance_id=INSTANCE_ID, ssh_key=pubkey)
+            print("🔑 SSH key attached to instance")
+
         # ── 1. Download dataset ──
         print(f"📦 Downloading dataset on instance {INSTANCE_ID}...")
         result = vast.execute(
