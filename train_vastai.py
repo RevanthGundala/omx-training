@@ -45,7 +45,7 @@ GPU_NAME = "RTX_4090"
 DISK_GB = 40
 
 POLL_INTERVAL = 15  # seconds between status checks
-BOOT_TIMEOUT = 600  # max seconds to wait for instance to start running
+BOOT_TIMEOUT = 1200  # max seconds to wait for instance to start running
 LOG_POLL_INTERVAL = 30  # seconds between log checks
 
 
@@ -216,13 +216,9 @@ def main():
         print(f"\n❌ Error: {e}")
     finally:
         if instance_id:
-            print(f"\n🗑️  Destroying instance {instance_id}...")
-            try:
-                vast.destroy_instance(id=instance_id)
-                print("✅ Instance destroyed.")
-            except Exception as e:
-                print(f"⚠️  Could not destroy instance: {e}")
-                print(f"   Destroy manually at https://cloud.vast.ai/instances/")
+            print(f"\n💡 Instance {instance_id} is still running.")
+            print(f"   Dashboard: https://cloud.vast.ai/instances/")
+            print(f"   To destroy: uv run python -c \"from vastai_sdk import VastAI; import os; VastAI(api_key=os.environ['VASTAI_API_KEY']).destroy_instance(id={instance_id})\"")
 
 
 if __name__ == "__main__":
