@@ -71,6 +71,7 @@ def main():
         optimizer_lr=LEARNING_RATE,
         optimizer_lr_backbone=LEARNING_RATE,
         vision_backbone=VISION_BACKBONE,
+        repo_id="RevanthGundala/act-pick-up-packet",
     )
 
     train_cfg = TrainPipelineConfig(
