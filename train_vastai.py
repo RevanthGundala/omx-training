@@ -15,6 +15,7 @@ Usage:
   2. Run: uv run python train_vastai.py
 """
 
+import base64
 import json
 import os
 import sys
@@ -129,17 +130,14 @@ def _wait_for_instance(vast, instance_id):
 
 
 def _stream_logs(vast, instance_id):
-    """Stream training logs from the remote log file until training completes."""
+    """Stream training logs from container stdout until training completes."""
     print("\n📋 Streaming training logs...\n")
     seen_lines = set()
 
     while True:
         try:
-            result = vast.execute(
-                id=instance_id,
-                COMMAND="tail -n 50 /workspace/train.log 2>/dev/null || echo 'Waiting for training output...'",
-            )
-            logs_str = result if isinstance(result, str) else str(result)
+            logs = vast.logs(INSTANCE_ID=instance_id, tail="50")
+            logs_str = logs if isinstance(logs, str) else str(logs)
 
             for line in logs_str.splitlines():
                 if line and line not in seen_lines:
@@ -207,9 +205,10 @@ def main():
             print(f"❌ train.py not found at {train_py}")
             sys.exit(1)
 
-        vast.copy(
-            src=str(train_py),
-            dst=f"{instance_id}:/workspace/train.py",
+        encoded = base64.b64encode(train_py.read_bytes()).decode()
+        vast.execute(
+            id=instance_id,
+            COMMAND=f'echo "{encoded}" | base64 -d > /workspace/train.py',
         )
         print("✅ train.py uploaded!")
 
@@ -217,7 +216,7 @@ def main():
         print("🏋️ Starting training...")
         vast.execute(
             id=instance_id,
-            COMMAND='cd /workspace && nohup bash -c \'python train.py 2>&1; echo "=== TRAINING COMPLETE ==="\' > /workspace/train.log 2>&1 &',
+            COMMAND='cd /workspace && nohup bash -c \'export HF_TOKEN="' + HF_TOKEN + '" && python train.py 2>&1; echo "=== TRAINING COMPLETE ==="\' | tee /workspace/train.log > /proc/1/fd/1 2>&1 &',
         )
 
         # ── 5. Stream logs ──
