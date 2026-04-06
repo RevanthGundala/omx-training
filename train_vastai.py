@@ -62,8 +62,8 @@ cd lerobot
 git checkout feature-omx-devel
 pip install -e ".[dynamixel]"
 
-# Login to HuggingFace (for private dataset)
-huggingface-cli login --token {hf_token}
+# Make HF token available to Python libraries
+export HF_TOKEN={hf_token}
 
 # Download dataset
 python -c "
