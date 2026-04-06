@@ -20,7 +20,7 @@ from vastai_sdk import VastAI
 # ──────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────
-INSTANCE_ID = 34218446
+INSTANCE_ID = 34219860 
 
 VASTAI_API_KEY = os.environ.get("VASTAI_API_KEY", "")
 
@@ -40,14 +40,17 @@ LOG_POLL_INTERVAL = 30
 
 
 def _stream_logs(vast, instance_id):
-    """Stream training logs from container stdout until training completes."""
+    """Stream training logs until training completes."""
     print("\n📋 Streaming training logs...\n")
     seen_lines = set()
 
     while True:
         try:
-            logs = vast.logs(INSTANCE_ID=instance_id, tail="50")
-            logs_str = logs if isinstance(logs, str) else str(logs)
+            result = vast.execute(
+                id=instance_id,
+                COMMAND="tail -n 50 /workspace/train.log 2>/dev/null || echo 'Waiting for training output...'",
+            )
+            logs_str = result if isinstance(result, str) else str(result)
 
             for line in logs_str.splitlines():
                 if line and line not in seen_lines:
@@ -82,13 +85,9 @@ def main():
 
         # ── 1. Fix huggingface-hub version + download dataset ──
         print(f"📦 Fixing deps and downloading dataset on instance {INSTANCE_ID}...")
-        vast.execute(
-            id=INSTANCE_ID,
-            COMMAND='pip install "huggingface-hub<1.0" -q',
-        )
         result = vast.execute(
             id=INSTANCE_ID,
-            COMMAND=f'export HF_TOKEN="{HF_TOKEN}" && python -c "'
+            COMMAND=f'pip install "huggingface-hub<1.0" -q && export HF_TOKEN="{HF_TOKEN}" && python -c "'
                     f'from lerobot.datasets.lerobot_dataset import LeRobotDataset; '
                     f'ds = LeRobotDataset(\\\"{DATASET_REPO_ID}\\\"); '
                     f'print(f\\\"Dataset: {{ds.num_episodes}} episodes, {{ds.num_frames}} frames\\\")'
