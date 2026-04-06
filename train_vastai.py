@@ -27,7 +27,18 @@ from vastai_sdk import VastAI
 # Configuration — edit these
 # ──────────────────────────────────────────────
 VASTAI_API_KEY = os.environ.get("VASTAI_API_KEY", "")
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+# Read HF token from env var, or fall back to local `hf auth login` cache
+def _get_hf_token():
+    token = os.environ.get("HF_TOKEN", "")
+    if token:
+        return token
+    token_path = Path.home() / ".cache" / "huggingface" / "token"
+    if token_path.exists():
+        return token_path.read_text().strip()
+    return ""
+
+HF_TOKEN = _get_hf_token()
 
 DATASET_REPO_ID = "RevanthGundala/pick_up_packet_test"
 GPU_NAME = "RTX_4090"
