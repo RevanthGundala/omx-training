@@ -11,6 +11,29 @@ from config import TELEOP_FPS as FPS
 from control_utils import maintain_fps
 from robot_utils import create_follower, create_leader, safe_disconnect
 
+SOFT_START_DURATION_S = 3.0
+
+
+def soft_start(follower, leader):
+    """Gradually move follower to match leader position to prevent jerk/overload."""
+    print(f"  Soft-starting: ramping follower to leader over {SOFT_START_DURATION_S}s...")
+    current = follower.get_observation()
+    target = leader.get_action()
+    steps = max(1, int(SOFT_START_DURATION_S * FPS))
+
+    for step in range(1, steps + 1):
+        loop_start = time.perf_counter()
+        alpha = step / steps
+        blended = {
+            key: current[key] + alpha * (target[key] - current[key])
+            for key in target
+        }
+        follower.send_action(blended)
+        target = leader.get_action()
+        maintain_fps(loop_start, FPS)
+
+    print("  Soft-start complete.")
+
 
 def main():
     leader = create_leader()
@@ -20,6 +43,8 @@ def main():
     leader.connect()
     print("Connecting follower arm...")
     follower.connect()
+
+    soft_start(follower, leader)
     print(f"Teleop running at {FPS} FPS. Move the leader arm! Press Ctrl+C to stop.\n")
 
     try:

@@ -32,6 +32,29 @@ EPISODE_DURATION_S = 90
 RESET_DURATION_S = 5
 USE_VIDEO = True
 PUSH_TO_HUB = False
+SOFT_START_DURATION_S = 3.0  # gradually ramp follower to leader position on connect
+
+
+def soft_start(follower, leader, duration_s=SOFT_START_DURATION_S):
+    """Gradually move follower to match leader position to prevent jerk/overload."""
+    print(f"  Soft-starting: ramping follower to leader over {duration_s}s...")
+    current = follower.get_observation()
+    target = leader.get_action()
+    steps = max(1, int(duration_s * FPS))
+
+    for step in range(1, steps + 1):
+        loop_start = time.perf_counter()
+        alpha = step / steps
+        blended = {
+            key: current[key] + alpha * (target[key] - current[key])
+            for key in target
+        }
+        follower.send_action(blended)
+        # Re-read leader in case it moved during ramp
+        target = leader.get_action()
+        maintain_fps(loop_start, FPS)
+
+    print("  Soft-start complete.")
 
 
 def record_one_episode(robot, leader, dataset, episode_num):
@@ -138,6 +161,9 @@ def main():
     leader.connect()
     print("Connecting follower arm...")
     follower.connect()
+
+    # Gradually ramp follower to leader position to prevent jerk/overload
+    soft_start(follower, leader)
 
     # Record episodes in a loop (→ ends episode, Ctrl+C stops entirely)
     episode = 0
