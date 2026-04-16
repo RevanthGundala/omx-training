@@ -9,11 +9,13 @@ Run on a machine with a CUDA GPU:
 """
 
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+from huggingface_hub import snapshot_download
 from torch.amp import GradScaler
 
 from lerobot.configs.default import DatasetConfig
@@ -33,9 +35,18 @@ from lerobot.utils.utils import get_safe_torch_device, has_method, format_big_nu
 # ──────────────────────────────────────────────
 # Configuration — edit these to match your setup
 # ──────────────────────────────────────────────
-DATASET_REPO_ID = "RevanthGundala/pick_up_packet_test"
-OUTPUT_DIR = Path("omx_scripts/outputs")
-DEVICE = "cuda"  # "cuda" for NVIDIA GPU, "mps" for Apple Silicon, "cpu" for CPU
+from config import TRAIN_DATASET_REPO_ID as DATASET_REPO_ID
+DATASET_REVISION = "main"
+DATASET_ROOT = (
+    Path.home()
+    / ".cache"
+    / "huggingface"
+    / "lerobot"
+    / f"{DATASET_REPO_ID.replace('/', '__')}__{DATASET_REVISION}"
+)
+OUTPUT_DIR = Path("outputs")
+DEVICE = "cuda"
+REQUIRE_CUDA = os.environ.get("OMX_REQUIRE_CUDA", "0") == "1"
 
 # Training hyperparameters
 BATCH_SIZE = 8
@@ -53,12 +64,32 @@ LEARNING_RATE = 1e-5
 VISION_BACKBONE = "resnet18"
 
 
+def _resolve_training_device(requested_device: str) -> torch.device:
+    requested_device = str(requested_device)
+
+    if requested_device == "cuda":
+        if torch.cuda.is_available():
+            return get_safe_torch_device("cuda", log=True)
+
+        message = "CUDA requested but not available."
+        if REQUIRE_CUDA:
+            raise RuntimeError(
+                f"{message} This run requires an NVIDIA GPU. "
+                "Try a different Vast.ai offer or a more compatible CUDA container image."
+            )
+
+        logging.warning(f"{message} Falling back to CPU.")
+        return get_safe_torch_device("cpu", log=True)
+
+    return get_safe_torch_device(requested_device, log=True)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     set_seed(SEED)
 
     # ── 1. Build the training config ──
-    dataset_config = DatasetConfig(repo_id=DATASET_REPO_ID)
+    dataset_config = DatasetConfig(repo_id=DATASET_REPO_ID, root=str(DATASET_ROOT))
 
     act_config = ACTConfig(
         input_features={},  # filled in by make_policy from dataset metadata
@@ -89,18 +120,30 @@ def main():
     train_cfg.validate()
 
     # ── 2. Setup device ──
-    device = get_safe_torch_device(DEVICE, log=True)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+    device = _resolve_training_device(DEVICE)
+    train_cfg.policy.device = device.type
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     # ── 3. Load dataset ──
     logging.info(f"Loading dataset: {DATASET_REPO_ID}")
+    snapshot_download(
+        repo_id=DATASET_REPO_ID,
+        repo_type="dataset",
+        revision=DATASET_REVISION,
+        local_dir=DATASET_ROOT,
+    )
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
     from lerobot.datasets.factory import resolve_delta_timestamps
-    ds_meta = LeRobotDatasetMetadata(DATASET_REPO_ID)
+    ds_meta = LeRobotDatasetMetadata(
+        DATASET_REPO_ID,
+        root=DATASET_ROOT,
+    )
     delta_timestamps = resolve_delta_timestamps(train_cfg.policy, ds_meta)
     dataset = LeRobotDataset(
         DATASET_REPO_ID,
+        root=DATASET_ROOT,
         delta_timestamps=delta_timestamps,
         tolerance_s=1e4,  # recording has uneven frame timing between episodes
     )

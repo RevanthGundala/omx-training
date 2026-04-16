@@ -10,26 +10,17 @@ Usage: just run this script. It will open the Rerun viewer automatically.
 """
 
 import rerun as rr
-import rerun.blueprint as rrb
-import torch
 import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-# ──────────────────────────────────────────────
-# Configuration — edit these to match your setup
-# ──────────────────────────────────────────────
-DATASET_REPO_ID = "RevanthGundala/pick_up_packet_test"
-EPISODE_INDEX = 2  # which episode to visualize (0-indexed)
+from config import JOINT_NAMES, TRAIN_DATASET_REPO_ID as DATASET_REPO_ID
+from rerun_utils import init_rerun
 
-JOINT_NAMES = [
-    "shoulder_pan",
-    "shoulder_lift",
-    "elbow_flex",
-    "wrist_flex",
-    "wrist_roll",
-    "gripper",
-]
+# ──────────────────────────────────────────────
+# Visualization-specific configuration
+# ──────────────────────────────────────────────
+EPISODE_INDEX = 2
 
 
 def main():
@@ -50,24 +41,7 @@ def main():
 
     # ── 3. Initialize Rerun viewer with a layout blueprint ──
     has_camera = "observation.images.front" in dataset.features
-
-    # Build per-joint time series views (action + state overlaid on same plot)
-    joint_views = [
-        rrb.TimeSeriesView(name=name, contents=[f"joints/{name}/**"])
-        for name in JOINT_NAMES
-    ]
-
-    if has_camera:
-        blueprint = rrb.Horizontal(
-            rrb.Spatial2DView(name="Camera", contents=["camera/**"]),
-            rrb.Vertical(*joint_views),
-            column_shares=[1, 2],
-        )
-    else:
-        blueprint = rrb.Vertical(*joint_views)
-
-    rr.init(f"{DATASET_REPO_ID}/episode_{EPISODE_INDEX}", spawn=True)
-    rr.send_blueprint(blueprint)
+    init_rerun(f"{DATASET_REPO_ID}/episode_{EPISODE_INDEX}", has_camera=has_camera)
 
     # ── 4. Log each frame ──
     for idx in tqdm.tqdm(range(from_idx, to_idx), desc="Loading frames"):
