@@ -51,21 +51,66 @@ python train.py
 
 ### 5. Train on Vast.ai — `train_vastai.py`
 
-Launch training on a Vast.ai RTX 4090 (~50 min, ~$0.40):
+Launch training on a Vast.ai GPU (for example an RTX 4090 at ~50 min, ~$0.40):
 
 ```bash
 export VASTAI_API_KEY="your-key"  # from https://cloud.vast.ai/account/
 export HF_TOKEN="your-token"      # from https://huggingface.co/settings/tokens
+# Optional overrides when changing GPU families or images:
+export OMX_GPU_NAME="RTX_4090"
+export OMX_VAST_IMAGE="pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel"
 uv run python train_vastai.py
 ```
 
 The script automatically launches an instance, uploads `train.py`, runs
-training, streams logs, and destroys the instance when done.
+training, streams logs, and leaves the instance running so you can download the
+checkpoints before destroying it.
+
+If the cheapest offer is unhealthy, the launcher retries the next matching
+offer and temporarily skips recently failed hosts using a cache at
+`~/.cache/omx-training/vastai_failed_offers.json`. It also runs a CUDA
+preflight before setup so an incompatible GPU/image combination fails fast.
+
+### 6. Live Eval — `eval.py`
+
+Run a saved checkpoint directly on the follower arm:
+
+```bash
+uv run python eval.py
+```
+
+By default it loads:
+
+```bash
+outputs/checkpoints/last/pretrained_model
+```
+
+and uses the live follower observation (joint state + camera) to predict the
+next action and send it back to the robot in a closed loop.
+
+### 7. Smoke Test — `smoke_test.py`
+
+Run a lightweight preflight before spending on Vast.ai:
+
+```bash
+uv run python smoke_test.py
+```
+
+This checks the dataset metadata against the Hugging Face repo tree, validates
+the `train.py` config on CPU, and verifies that `train_vastai.py` still
+generates the expected Vast onstart script.
+
+To also run a real 1-step local training smoke test:
+
+```bash
+uv run python smoke_test.py --train-step
+```
 
 ## Configuration
 
-Each script has a **Configuration** section at the top of the file. Edit the
-constants directly — no command-line arguments needed.
+Each script has a **Configuration** section at the top of the file. For
+`train_vastai.py`, you can also override the target GPU and base image with
+`OMX_GPU_NAME` and `OMX_VAST_IMAGE` instead of editing the file.
 
 ## Finding Your Serial Ports
 

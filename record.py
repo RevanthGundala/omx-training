@@ -17,7 +17,7 @@ from huggingface_hub import HfApi
 from pynput import keyboard
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 
 from config import FPS, RECORD_DATASET_REPO_ID as DATASET_REPO_ID, TASK_NAME
 from control_utils import maintain_fps
@@ -26,7 +26,7 @@ from robot_utils import create_follower, create_leader, safe_disconnect
 # ──────────────────────────────────────────────
 # Recording-specific configuration
 # ──────────────────────────────────────────────
-USE_CAMERA = True
+USE_CAMERA = False 
 NUM_EPISODES = 50
 EPISODE_DURATION_S = 90
 RESET_DURATION_S = 5

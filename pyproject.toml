@@ -2,12 +2,14 @@
 name = "omx-training"
 version = "0.1.0"
 description = "OMX robot arm training scripts using LeRobot"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
-    "lerobot @ git+https://github.com/ROBOTIS-GIT/lerobot.git@feature-omx-devel",
+    "lerobot[dynamixel]>=0.5.1",
     "rerun-sdk>=0.22",
     "pynput>=1.7",
     "vastai-sdk>=0.2",
+    "pytest>=9.0.3",
+    "modal>=1.4.1",
 ]
 
 [build-system]

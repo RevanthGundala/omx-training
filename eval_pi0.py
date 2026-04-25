@@ -20,7 +20,7 @@ import numpy as np
 import rerun as rr
 import requests
 
-from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 
 from config import FPS, JOINT_NAMES, PI0_MODEL_REPO_ID as HF_REPO_ID, TASK_NAME
 from control_utils import ensure_camera_size, maintain_fps

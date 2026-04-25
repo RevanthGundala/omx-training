@@ -17,7 +17,7 @@ from pathlib import Path
 import rerun as rr
 import torch
 
-from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
