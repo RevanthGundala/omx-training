@@ -143,7 +143,7 @@ def main() -> None:
         l_span = l_range_max - l_range_min
         f_span = f_range_max - f_range_min
         OPEN_PAD_PCT = 0.03   # shrink open end inward 3%
-        CLOSE_PAD_PCT = 0.01  # extend closed end outward 1%
+        CLOSE_PAD_PCT = 0.05  # extend closed end outward 5% (takes up backlash)
 
         if l_inverted:
             # Leader: open=low (range_min), closed=high (range_max)

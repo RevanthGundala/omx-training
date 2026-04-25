@@ -155,8 +155,16 @@ Additionally, the `range_max` was measured during calibration with torque OFF (u
 
 ### Current Calibration Values (as of working state)
 
-**Leader gripper:** `drive_mode=0, homing_offset=0, range_min=1459, range_max=3040, sw_invert=true`
-**Follower gripper:** `drive_mode=0, homing_offset=0, range_min=1016, range_max=2279, sw_invert=false`
+**Leader gripper:** `drive_mode=0, homing_offset=0, range_min=1511, range_max=3056, sw_invert=true`
+**Follower gripper:** `drive_mode=0, homing_offset=0, range_min=950, range_max=2235, sw_invert=false`
+
+> **Note on `range_min`/`range_max` and `Goal_Position`:** LeRobot sends
+> `Goal_Position = range_min` when commanding 0% (fully closed, after
+> inversion). If `range_min` equals the physical stop, the motor sits exactly
+> at the stop and mechanical backlash leaves a visible jaw gap. Setting
+> `range_min` ~50 ticks past the physical stop makes the motor push into the
+> stop, eliminating the gap. `calibrate_gripper.py` applies 5% closed-end
+> padding automatically.
 
 ---
 
