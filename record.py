@@ -29,7 +29,7 @@ from pynput import keyboard
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 
-from config import FPS, JOINT_NAMES, RECORD_DATASET_REPO_ID as DATASET_REPO_ID, TASK_NAME
+from config import CAMERAS, FPS, JOINT_NAMES, RECORD_DATASET_REPO_ID as DATASET_REPO_ID, TASK_NAME
 from control_utils import maintain_fps
 from rerun_utils import init_rerun
 from robot_utils import create_follower, create_leader, safe_disconnect
@@ -72,8 +72,9 @@ def replay_from_buffer(action_buffer, state_buffer, action_names, state_names, f
             # Stream live camera to Rerun during replay
             observation = follower.get_observation()
             rr.set_time("replay_step", sequence=idx)
-            if "front" in observation:
-                rr.log("camera/front", rr.Image(observation["front"]))
+            for cam_name in CAMERAS:
+                if cam_name in observation:
+                    rr.log(f"camera/{cam_name}", rr.Image(observation[cam_name]))
             for name in JOINT_NAMES:
                 key = f"{name}.pos"
                 if key in observation:
@@ -171,8 +172,9 @@ def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
 
             # ── Rerun: stream camera + joints live ──
             rr.set_time("step", sequence=rerun_step)
-            if "front" in observation:
-                rr.log("camera/front", rr.Image(observation["front"]))
+            for cam_name in CAMERAS:
+                if cam_name in observation:
+                    rr.log(f"camera/{cam_name}", rr.Image(observation[cam_name]))
             for i, name in enumerate(JOINT_NAMES):
                 obs_key = f"{name}.pos"
                 act_key = f"{name}.pos"
@@ -215,16 +217,41 @@ def main():
 
     # Create or resume the dataset
     dataset_path = Path.home() / ".cache/huggingface/lerobot" / DATASET_REPO_ID
-    required_meta = ["info.json", "tasks.jsonl", "episodes.jsonl"]
-    if all((dataset_path / "meta" / f).exists() for f in required_meta):
-        print(f"\nResuming existing dataset at {dataset_path}")
-        dataset = LeRobotDataset(DATASET_REPO_ID)
-        dataset.start_image_writer(num_processes=0, num_threads=4)
-        print(f"  Existing episodes: {dataset.num_episodes}")
-    else:
-        # Remove stale directory if it exists without valid metadata
-        if dataset_path.exists():
+    info_path = dataset_path / "meta" / "info.json"
+
+    if info_path.exists():
+        import json
+        with open(info_path) as f:
+            info = json.load(f)
+        if info.get("total_episodes", 0) > 0:
+            # Has committed episodes — resume using the proper classmethod
+            print(f"\nResuming existing dataset at {dataset_path}")
+            dataset = LeRobotDataset.resume(
+                repo_id=DATASET_REPO_ID,
+                root=str(dataset_path),
+                image_writer_processes=0,
+                image_writer_threads=4,
+            )
+            print(f"  Existing episodes: {dataset.num_episodes}")
+        else:
+            # Created but 0 episodes — safe to recreate
+            print(f"\n⚠️  Found empty dataset (0 episodes). Re-creating.")
             shutil.rmtree(dataset_path)
+            dataset = LeRobotDataset.create(
+                repo_id=DATASET_REPO_ID,
+                fps=FPS,
+                robot_type="omx_follower",
+                features=dataset_features,
+                use_videos=USE_VIDEO,
+                image_writer_processes=0,
+                image_writer_threads=4,
+            )
+    else:
+        # No dataset at all — create fresh
+        if dataset_path.exists():
+            backup_path = dataset_path.with_name(dataset_path.name + f"_backup_{int(time.time())}")
+            print(f"\n⚠️  Existing directory has no info.json. Backing up to: {backup_path}")
+            shutil.move(str(dataset_path), str(backup_path))
         print(f"\nCreating new dataset: {DATASET_REPO_ID}")
         dataset = LeRobotDataset.create(
             repo_id=DATASET_REPO_ID,
