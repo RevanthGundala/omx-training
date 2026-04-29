@@ -197,6 +197,7 @@ from config import (
     CAMERA_HEIGHT,
     CAMERA_INDEX,
     CAMERA_WIDTH,
+    CAMERAS,
     FOLLOWER_PORT,
     FPS,
     LEADER_PORT,
@@ -215,12 +216,13 @@ def create_follower(
     fps = fps or FPS
     cameras = {}
     if camera:
-        cameras["front"] = OpenCVCameraConfig(
-            index_or_path=CAMERA_INDEX,
-            fps=fps,
-            width=camera_width or CAMERA_WIDTH,
-            height=camera_height or CAMERA_HEIGHT,
-        )
+        for name, index in CAMERAS.items():
+            cameras[name] = OpenCVCameraConfig(
+                index_or_path=index,
+                fps=fps,
+                width=camera_width or CAMERA_WIDTH,
+                height=camera_height or CAMERA_HEIGHT,
+            )
     config = OmxFollowerConfig(port=port, id="omx_follower_arm", cameras=cameras)
     return PatchedOmxFollower(config)
 

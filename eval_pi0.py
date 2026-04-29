@@ -1,9 +1,12 @@
 """
-eval_pi0.py — Run a Pi0 policy live on the OMX follower arm.
+eval_pi0.py — Run a Pi0 or PI0.5 policy live on the OMX follower arm.
 
 Supports two modes:
-  --local    Load Pi0 on this machine (slow on CPU/MPS)
+  --local    Load policy on this machine (slow on CPU/MPS)
   --remote   Use a Modal GPU server (deploy serve_pi0_modal.py first)
+
+Use --pi05 to load a PI0.5 checkpoint instead of PI0.
+Use --checkpoint to load a finetuned checkpoint from a local path.
 
 The remote mode sends observations over HTTP and executes returned action
 chunks locally, re-fetching when the chunk is exhausted.
@@ -22,7 +25,7 @@ import requests
 
 from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 
-from config import FPS, JOINT_NAMES, PI0_MODEL_REPO_ID as HF_REPO_ID, TASK_NAME
+from config import FPS, JOINT_NAMES, PI0_MODEL_REPO_ID, PI05_MODEL_REPO_ID, TASK_NAME
 from control_utils import ensure_camera_size, maintain_fps
 from rerun_utils import init_rerun
 from robot_utils import create_follower, safe_disconnect
@@ -41,10 +44,12 @@ def _build_follower():
 # ──────────────────────────────────────────────
 # Local inference
 # ──────────────────────────────────────────────
-def _load_local_policy():
+def _load_local_policy(checkpoint_path=None, use_pi05=False):
     import torch
-    from lerobot.policies.pi0.modeling_pi0 import PI0Policy
-    from lerobot.utils.utils import get_safe_torch_device
+    try:
+        from lerobot.utils.device_utils import get_safe_torch_device
+    except ImportError:
+        from lerobot.utils.utils import get_safe_torch_device
 
     if torch.cuda.is_available():
         dev = "cuda"
@@ -54,26 +59,57 @@ def _load_local_policy():
         dev = "cpu"
     device = get_safe_torch_device(dev, log=True)
 
-    print(f"Loading Pi0 locally from {HF_REPO_ID}...")
+    if checkpoint_path:
+        # Load finetuned checkpoint — auto-detect pi0 vs pi0.5 from config
+        from safetensors.torch import load_file
+        import json
+        from pathlib import Path
 
-    NUM_JOINTS = 6
-    NUM_CHANNELS = 3
-    dataset_stats = {
-        "observation.state": {
-            "mean": torch.zeros(NUM_JOINTS),
-            "std": torch.ones(NUM_JOINTS),
-        },
-        "observation.images.front": {
-            "mean": torch.zeros(NUM_CHANNELS, 1, 1),
-            "std": torch.ones(NUM_CHANNELS, 1, 1),
-        },
-        "action": {
-            "mean": torch.zeros(NUM_JOINTS),
-            "std": torch.ones(NUM_JOINTS),
-        },
-    }
+        ckpt_dir = Path(checkpoint_path)
+        config_path = ckpt_dir / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"No config.json in {ckpt_dir}")
 
-    policy = PI0Policy.from_pretrained(HF_REPO_ID, dataset_stats=dataset_stats)
+        with open(config_path) as f:
+            config_data = json.load(f)
+
+        model_type = config_data.get("model_type", "")
+        if model_type == "pi05" or use_pi05:
+            from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+            print(f"Loading PI0.5 checkpoint from {checkpoint_path}...")
+            policy = PI05Policy.from_pretrained(checkpoint_path)
+        else:
+            from lerobot.policies.pi0.modeling_pi0 import PI0Policy
+            print(f"Loading PI0 checkpoint from {checkpoint_path}...")
+            policy = PI0Policy.from_pretrained(checkpoint_path)
+    elif use_pi05:
+        from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+        repo_id = PI05_MODEL_REPO_ID
+        print(f"Loading PI0.5 base model from {repo_id}...")
+        policy = PI05Policy.from_pretrained(repo_id)
+    else:
+        from lerobot.policies.pi0.modeling_pi0 import PI0Policy
+        repo_id = PI0_MODEL_REPO_ID
+        print(f"Loading PI0 base model from {repo_id}...")
+
+        NUM_JOINTS = 6
+        NUM_CHANNELS = 3
+        dataset_stats = {
+            "observation.state": {
+                "mean": torch.zeros(NUM_JOINTS),
+                "std": torch.ones(NUM_JOINTS),
+            },
+            "observation.images.front": {
+                "mean": torch.zeros(NUM_CHANNELS, 1, 1),
+                "std": torch.ones(NUM_CHANNELS, 1, 1),
+            },
+            "action": {
+                "mean": torch.zeros(NUM_JOINTS),
+                "std": torch.ones(NUM_JOINTS),
+            },
+        }
+        policy = PI0Policy.from_pretrained(repo_id, dataset_stats=dataset_stats)
+
     policy.config.device = device.type
     policy.to(device)
     policy.eval()
@@ -117,16 +153,22 @@ def _predict_remote(observation_frame, server_url, observation):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pi0 eval on OMX follower")
+    parser = argparse.ArgumentParser(description="Pi0/Pi0.5 eval on OMX follower")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--local", action="store_true", help="Run Pi0 locally")
+    mode.add_argument("--local", action="store_true", help="Run policy locally")
     mode.add_argument("--remote", type=str, metavar="URL",
                       help="Modal server URL (e.g. https://your-app--pi0server-predict.modal.run)")
+    parser.add_argument("--pi05", action="store_true", help="Use PI0.5 instead of PI0")
+    parser.add_argument("--checkpoint", type=str, metavar="PATH",
+                        help="Local checkpoint path (overrides base model)")
     args = parser.parse_args()
 
     policy = device = server_url = None
     if args.local:
-        policy, device = _load_local_policy()
+        policy, device = _load_local_policy(
+            checkpoint_path=args.checkpoint,
+            use_pi05=args.pi05,
+        )
 
     if args.remote:
         server_url = args.remote.rstrip("/")
@@ -147,7 +189,8 @@ def main():
     follower.connect(calibrate=False)
 
     # ── Rerun setup ──
-    init_rerun("omx_eval_pi0")
+    model_name = "pi05" if args.pi05 else "pi0"
+    init_rerun(f"omx_eval_{model_name}", save_rrd=True)
 
     try:
         print(f"Starting Pi0 eval in {START_DELAY_S}s. Press Ctrl+C to stop.")
@@ -213,7 +256,7 @@ def main():
             # ── Rerun logging ──
             rr.set_time_sequence("step", step)
             rr.set_time_seconds("time", time.perf_counter() - run_start)
-            rr.log("metrics/loop_hz", rr.Scalar(hz))
+            rr.log("metrics/loop_hz", rr.Scalars(hz))
 
             if cam_key in observation:
                 rr.log("camera/front", rr.Image(observation[cam_key]))
@@ -221,11 +264,11 @@ def main():
             for i, name in enumerate(JOINT_NAMES):
                 if "observation.state" in observation_frame:
                     state_val = observation_frame["observation.state"][i].item()
-                    rr.log(f"joints/{name}/state", rr.Scalar(state_val))
-                rr.log(f"joints/{name}/policy_action", rr.Scalar(float(action_values[i])))
-                rr.log(f"joints/{name}/sent_action", rr.Scalar(sent_action[f"{name}.pos"]))
+                    rr.log(f"joints/{name}/state", rr.Scalars(state_val))
+                rr.log(f"joints/{name}/policy_action", rr.Scalars(float(action_values[i])))
+                rr.log(f"joints/{name}/sent_action", rr.Scalars(sent_action[f"{name}.pos"]))
                 if name in frozen_joint_targets:
-                    rr.log(f"joints/{name}/frozen_target", rr.Scalar(frozen_joint_targets[name]))
+                    rr.log(f"joints/{name}/frozen_target", rr.Scalars(frozen_joint_targets[name]))
 
             step += 1
             queue_len = len(action_queue)

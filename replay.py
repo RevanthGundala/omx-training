@@ -16,9 +16,8 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.utils.robot_utils import busy_wait
 
-from config import FOLLOWER_PORT, RECORD_DATASET_REPO_ID as DATASET_REPO_ID
+from config import RECORD_DATASET_REPO_ID as DATASET_REPO_ID
 from rerun_utils import build_joint_blueprint
 from robot_utils import create_follower, safe_disconnect
 
@@ -71,7 +70,7 @@ def _load_episode_data():
 
 
 def _move_to_start(
-    follower: OmxFollower,
+    follower,
     start_state: dict[str, float],
     fps: int,
 ) -> None:
@@ -90,7 +89,9 @@ def _move_to_start(
             for key in start_state
         }
         follower.send_action(target)
-        busy_wait(max(1.0 / fps - (time.perf_counter() - loop_start), 0.0))
+        sleep_t = 1.0 / fps - (time.perf_counter() - loop_start)
+        if sleep_t > 0:
+            time.sleep(sleep_t)
 
 
 def main():
@@ -132,8 +133,8 @@ def main():
             max_abs_error = 0.0
             max_abs_error_joint = joint_names[0]
 
-            rr.set_time_sequence("step", idx)
-            rr.set_time_seconds("time", time.perf_counter() - run_start)
+            rr.set_time("step", sequence=idx)
+            rr.set_time("time", timestamp=time.perf_counter() - run_start)
 
             for action_key, state_key in zip(action_names, state_names, strict=True):
                 joint_name = _base_joint_name(action_key)
@@ -143,17 +144,17 @@ def main():
                 sent_val = float(sent_action[action_key])
                 err_val = live_val - ref_val
 
-                rr.log(f"joints/{joint_name}/live_state", rr.Scalar(live_val))
-                rr.log(f"joints/{joint_name}/reference_state", rr.Scalar(ref_val))
-                rr.log(f"joints/{joint_name}/replay_action", rr.Scalar(replay_val))
-                rr.log(f"joints/{joint_name}/sent_action", rr.Scalar(sent_val))
-                rr.log(f"joints/{joint_name}/tracking_error", rr.Scalar(err_val))
+                rr.log(f"joints/{joint_name}/live_state", rr.Scalars([live_val]))
+                rr.log(f"joints/{joint_name}/reference_state", rr.Scalars([ref_val]))
+                rr.log(f"joints/{joint_name}/replay_action", rr.Scalars([replay_val]))
+                rr.log(f"joints/{joint_name}/sent_action", rr.Scalars([sent_val]))
+                rr.log(f"joints/{joint_name}/tracking_error", rr.Scalars([err_val]))
 
                 if abs(err_val) > max_abs_error:
                     max_abs_error = abs(err_val)
                     max_abs_error_joint = joint_name
 
-            rr.log("metrics/max_abs_tracking_error", rr.Scalar(max_abs_error))
+            rr.log("metrics/max_abs_tracking_error", rr.Scalars([max_abs_error]))
 
             print(
                 f"Step {idx + 1:05d}/{dataset.num_frames:05d} | "
@@ -161,7 +162,9 @@ def main():
                 end="\r",
             )
 
-            busy_wait(max(1.0 / fps - (time.perf_counter() - loop_start), 0.0))
+            sleep_t = 1.0 / fps - (time.perf_counter() - loop_start)
+            if sleep_t > 0:
+                time.sleep(sleep_t)
 
     except KeyboardInterrupt:
         print("\n\nStopping replay...")

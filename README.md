@@ -88,6 +88,12 @@ outputs/checkpoints/last/pretrained_model
 and uses the live follower observation (joint state + camera) to predict the
 next action and send it back to the robot in a closed loop.
 
+If the checkpoint was trained without image inputs, `eval.py` now still opens
+the front camera for monitoring and Rerun logging by default, but the policy
+continues to act from joint state only. To make camera frames affect the
+actions, the checkpoint itself must be trained with `observation.images.*`
+inputs.
+
 ### 7. Smoke Test — `smoke_test.py`
 
 Run a lightweight preflight before spending on Vast.ai:

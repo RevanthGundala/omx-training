@@ -61,7 +61,7 @@ def main():
         if "observation.state" in item:
             for i, name in enumerate(JOINT_NAMES):
                 val = item["observation.state"][i].item()
-                rr.log(f"joints/{name}/state", rr.Scalar(val))
+                rr.log(f"joints/{name}/state", rr.Scalars(val))
 
         # Log joint actions (commanded positions)
         if "action" in item:
@@ -72,7 +72,7 @@ def main():
                 if abs(val) > 10_000:
                     continue
 
-                rr.log(f"joints/{name}/action", rr.Scalar(val))
+                rr.log(f"joints/{name}/action", rr.Scalars(val))
 
     print("\nDone! The Rerun viewer should be open.")
     print("Tips:")
