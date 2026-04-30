@@ -114,7 +114,7 @@ def main():
         freeze_vision_encoder=FREEZE_VISION_ENCODER,
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
         dtype=DTYPE,
-        repo_id="RevanthGundala/pi05-single-fold-tissue",
+        repo_id="RevanthGundala/pi05-pour-water",
     )
 
     train_cfg = TrainPipelineConfig(

@@ -1,8 +1,8 @@
 """Shared configuration constants for OMX training scripts."""
 
 # ── Hardware Ports ──
-LEADER_PORT = "/dev/tty.usbmodem11301"
-FOLLOWER_PORT = "/dev/tty.usbmodem11401"
+LEADER_PORT = "/dev/tty.usbmodem1301"
+FOLLOWER_PORT = "/dev/tty.usbmodem1401"
 
 # ── Joint Configuration ──
 JOINT_NAMES = [
@@ -19,19 +19,14 @@ JOINT_NAMES = [
 # camera/<name>, in datasets as observation.images.<name>, and the trained
 # policy is fed frames matched by these names.
 #
-# IMPORTANT: this mapping must agree with the camera name used at training
-# time. The 050000 checkpoint expects `observation.images.front`, even though
-# physically that feed comes from the wrist-mounted camera. So `front` here
-# must point at the physical wrist camera's OpenCV index.
-#
 # On macOS, index 0 is typically the built-in FaceTime camera; external USB
 # cameras are usually 1, 2, ... Run:
 #   uv run python -c "from lerobot.cameras.opencv.camera_opencv import OpenCVCamera; print(OpenCVCamera.find_cameras())"
 # to enumerate.
 CAMERAS = {
-    "front": 1,  # physical wrist camera; matches `observation.images.front` in dataset/checkpoint
+    "wrist": 1,  # Innomaker wrist-mounted camera
+    "top": 0,    # Logitech 1080P overhead camera
 }
-CAMERA_INDEX = CAMERAS["front"]  # back-compat for scripts that expect a single index
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 
@@ -40,10 +35,10 @@ FPS = 30
 TELEOP_FPS = 60
 
 # ── Dataset & Models ──
-RECORD_DATASET_REPO_ID = "RevanthGundala/001-fold-tissue"
-TRAIN_DATASET_REPO_ID = "RevanthGundala/001-fold-tissue"
+RECORD_DATASET_REPO_ID = "RevanthGundala/002-pour-water"
+TRAIN_DATASET_REPO_ID = "RevanthGundala/002-pour-water"
 PI0_MODEL_REPO_ID = "lerobot/pi0"
 PI05_MODEL_REPO_ID = "lerobot/pi05_base"
 
 # ── Task ──
-TASK_NAME = "Do a single fold of tissue while laying completely flat."
+TASK_NAME = "Pour water from one plastic bottle into another."

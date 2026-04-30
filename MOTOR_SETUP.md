@@ -137,13 +137,14 @@ Additionally, the `range_max` was measured during calibration with torque OFF (u
 | `inspect_state.py` | Read-only deep diagnostic: EEPROM vs JSON for every motor |
 | `teleop.py` | Main teleoperation loop |
 | `diagnose_gripper_range.py` | Live encoder monitor to find raw gripper range by hand |
+| `diagnose_wrist_roll.py` | Check wrist_roll centering and suggest homing_offset fix |
 | `sweep_leader_current.py` | Sweep Goal_Current values to find usable trigger resistance |
 
 ### Core Module
 
 | File | Purpose |
 |---|---|
-| `robot_utils.py` | `PatchedOmxLeader`, `PatchedOmxFollower`, `create_leader()`, `create_follower()`, gripper inversion loading |
+| `robot_utils.py` | `PatchedOmxLeader`, `PatchedOmxFollower`, `_write_calibration_safe()`, `create_leader()`, `create_follower()`, gripper inversion loading |
 
 ### Calibration Data (on disk)
 
@@ -183,6 +184,57 @@ Compares JSON calibration values to motor EEPROM for all motors. Any mismatch �
 
 ### Current-Controlled Position Mode
 The leader gripper motor has a position target (rest pose) but caps its torque at `Goal_Current` mA. This makes it act like a variable-stiffness spring: low current = soft trigger feel, high current = stiff. We use 30mA — enough to gently return the trigger when released, soft enough that the user can squeeze past it to reach the full range.
+
+---
+
+## Problem 7: Wrist Roll Range Too Limited for Pouring
+
+### Symptom
+During teleop, rotating the leader wrist_roll hits the normalized `-100` floor after ~180° of rotation. Follower wrist stops following.
+
+### Root Cause (two issues)
+
+**Issue A — Range too narrow:** The default calibration range `[0, 4095]` (one revolution = 360°) maps to the full `[-100, +100]` normalized output. 180° of physical rotation consumes 50 normalized units — which is fine if you start centered, but not if your homing_offset puts you off-center.
+
+**Issue B — Off-center homing_offset:** The `homing_offset` determines where the motor's rest position falls within the normalized range. If the raw encoder at rest is `1116` and `homing_offset = -3012`, then `Present_Position = 1116 + (-3012) = -1896`, which normalizes to **-46.3** — almost halfway to the -100 floor. Only ~194° of rotation remains before saturation.
+
+**The formula:** `Present_Position = raw_encoder + Homing_Offset`. LeRobot normalizes Present_Position into [-100, +100] using `range_min`/`range_max`. If Present_Position at rest isn't near the center of that range, you get asymmetric headroom.
+
+### Fix
+
+1. **Expanded range to `[-4096, 4095]`** (2 full revolutions = 720°). This gives 360° of rotation in each direction from center before hitting the normalized limit.
+
+2. **Fixed homing_offset** so rest position normalizes to ~0. The correct formula is:
+   ```
+   homing_offset = range_center - raw_encoder_at_rest
+   ```
+   For our leader: `0 - 1116 = -1116`. For our follower: `0 - 1095 = -1084` (was already correct).
+
+3. **Added `_write_calibration_safe()` helper** in `robot_utils.py`. Dynamixel `Min_Position_Limit` / `Max_Position_Limit` EEPROM registers only accept `[0, 4095]`, but in Extended Position mode they're ignored by the firmware anyway. LeRobot's `write_calibration()` still tries to write them, so `_write_calibration_safe()` clamps range values to `[0, 4095]` for the EEPROM write while keeping the extended range in the in-memory calibration dict for normalization.
+
+### Diagnostic
+Run `uv run python diagnose_wrist_roll.py` to check where each arm's wrist_roll rests in the normalized range. If normalized isn't near 0, use the suggested `homing_offset`.
+
+### Current Values
+- **Leader wrist_roll:** `homing_offset=-1116, range=[-4096, 4095]`
+- **Follower wrist_roll:** `homing_offset=-1084, range=[-4096, 4095]`
+
+---
+
+## Files Reference
+
+### Scripts (run by user)
+
+| Script | Purpose |
+|---|---|
+| `align_follower.py` | Align body joints (not gripper) between leader and follower |
+| `calibrate_gripper.py` | Measure gripper range + direction, save calibration + inversion flags |
+| `check_calibration.py` | Read-only snapshot comparing leader vs follower positions |
+| `inspect_state.py` | Read-only deep diagnostic: EEPROM vs JSON for every motor |
+| `teleop.py` | Main teleoperation loop |
+| `diagnose_gripper_range.py` | Live encoder monitor to find raw gripper range by hand |
+| `diagnose_wrist_roll.py` | Check wrist_roll centering and suggest homing_offset fix |
+| `sweep_leader_current.py` | Sweep Goal_Current values to find usable trigger resistance |
 
 ---
 

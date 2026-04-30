@@ -37,13 +37,12 @@ def build_joint_blueprint(
     cam_panel = rrb.Vertical(*cam_views) if cam_views else None
 
     if has_camera and camera_primary and cam_panel is not None:
-        return rrb.Tabs(
-            rrb.Horizontal(*cam_views, name="Cameras")
-            if len(cam_views) > 1
-            else cam_views[0],
-            rrb.Vertical(*joint_views, name="Joints"),
-            active_tab="Cameras" if len(cam_views) > 1 else "Camera",
-        )
+        if len(cam_views) > 1:
+            cam_tab = rrb.Horizontal(*cam_views, name="Cameras")
+        else:
+            cam_tab = cam_views[0]
+        joint_tab = rrb.Vertical(*joint_views, name="Joints")
+        return rrb.Tabs(cam_tab, joint_tab)
     if has_camera and cam_panel is not None:
         return rrb.Horizontal(
             cam_panel,

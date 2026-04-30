@@ -1,8 +1,8 @@
 """
-serve_pi0_modal.py — Modal GPU inference server for Pi0 policy.
+serve_pi0_modal.py — Modal GPU inference server for PI0.5 finetuned policy.
 
-Deploys Pi0 on an A10G GPU and exposes a /predict endpoint.
-The local eval script sends observations and receives action chunks.
+Loads the finetuned PI0.5 checkpoint from the training volume and exposes
+/predict, /reset, and /health endpoints.
 
 Deploy:  modal deploy serve_pi0_modal.py
 Dev:     modal serve serve_pi0_modal.py
@@ -10,125 +10,190 @@ Dev:     modal serve serve_pi0_modal.py
 
 import modal
 
-app = modal.App("omx-pi0")
+app = modal.App("omx-pi05-eval")
 
-HF_REPO_ID = "lerobot/pi0"
-TASK_NAME = "Pick up remote and place it onto the gray circle"
-MODEL_CACHE = "/root/model-cache"
-
+DATASET_REPO_ID = "RevanthGundala/002-pour-water"
+CHECKPOINT_STEP = "010000"  # or "005000" for the earlier checkpoint
 
 hf_secret = modal.Secret.from_name("huggingface")
+vol = modal.Volume.from_name("omx-pi0-training-logs", create_if_missing=True)
 
-
-def download_model():
-    """Download Pi0 weights at image build time so they're baked into the image."""
-    import os
-    os.environ["HF_HOME"] = MODEL_CACHE
-    from huggingface_hub import login
-    login(token=os.environ["HF_TOKEN"])
-    from lerobot.policies.pi0.modeling_pi0 import PI0Policy
-    PI0Policy.from_pretrained(HF_REPO_ID)
-
-
-pi0_image = (
+pi05_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
+    .apt_install("git", "ffmpeg")
     .pip_install(
         "torch",
         "torchvision",
-        "lerobot[pi0] @ git+https://github.com/ROBOTIS-GIT/lerobot.git@feature-omx-devel",
+        "lerobot[pi]",
         "fastapi[standard]",
         "numpy",
-        "pytest",
     )
-    .run_function(download_model, secrets=[hf_secret])
+    .pip_install("av")
 )
 
 
 @app.cls(
-    image=pi0_image,
+    image=pi05_image,
     gpu="A10G",
     scaledown_window=300,
     timeout=600,
+    min_containers=1,
+    volumes={"/workspace/outputs": vol},
+    secrets=[hf_secret],
 )
 class Pi0Server:
     @modal.enter()
     def load_model(self):
         import os
-        os.environ["HF_HOME"] = MODEL_CACHE
         import torch
-        from lerobot.policies.pi0.modeling_pi0 import PI0Policy
+        from pathlib import Path
+        from huggingface_hub import snapshot_download
 
-        # OMX follower has 6 joints, camera is 3-channel
-        NUM_JOINTS = 6
-        NUM_CHANNELS = 3
-        dataset_stats = {
-            "observation.state": {
-                "mean": torch.zeros(NUM_JOINTS),
-                "std": torch.ones(NUM_JOINTS),
-            },
-            "observation.images.camera0": {
-                "mean": torch.zeros(NUM_CHANNELS, 1, 1),
-                "std": torch.ones(NUM_CHANNELS, 1, 1),
-            },
-            "action": {
-                "mean": torch.zeros(NUM_JOINTS),
-                "std": torch.ones(NUM_JOINTS),
-            },
-        }
+        os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
+        vol.reload()
 
-        print("Loading Pi0 from cache...")
+        checkpoint_path = Path(f"/workspace/outputs/run/checkpoints/{CHECKPOINT_STEP}/pretrained_model")
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint not found at {checkpoint_path}. "
+                f"Available: {list(Path('/workspace/outputs').rglob('config.json'))}"
+            )
+
+        # Download dataset metadata for normalization stats
+        dataset_root = Path("/tmp/dataset")
+        snapshot_download(
+            repo_id=DATASET_REPO_ID,
+            repo_type="dataset",
+            local_dir=dataset_root,
+        )
+
+        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        from lerobot.policies.pi05.configuration_pi05 import PI05Config
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+        from lerobot.policies.factory import make_policy, make_pre_post_processors
+
+        ds_meta = LeRobotDatasetMetadata(DATASET_REPO_ID, root=dataset_root)
+
+        print(f"Loading PI0.5 checkpoint from {checkpoint_path}...")
         self.device = torch.device("cuda")
-        self.policy = PI0Policy.from_pretrained(HF_REPO_ID, dataset_stats=dataset_stats)
 
-        # Override input features to match our single-camera OMX setup
-        from lerobot.configs.types import PolicyFeature, FeatureType
-        self.policy.config.input_features = {
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(NUM_JOINTS,)),
-            "observation.images.camera0": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
-        }
-        self.policy.config.output_features = {
-            "action": PolicyFeature(type=FeatureType.ACTION, shape=(NUM_JOINTS,)),
-        }
-
-        self.policy.config.device = "cuda"
-        self.policy.to(self.device)
+        self.policy = make_policy(
+            cfg=PI05Config(
+                pretrained_path=str(checkpoint_path),
+                device="cuda",
+                chunk_size=50,
+                n_action_steps=50,
+                rtc_config=RTCConfig(enabled=True, execution_horizon=10),
+            ),
+            ds_meta=ds_meta,
+        )
         self.policy.eval()
-        self.policy.reset()
-        print("Pi0 ready on GPU.")
+        self.policy.to(self.device)
+
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            policy_cfg=self.policy.config,
+            pretrained_path="lerobot/pi05_base",
+            dataset_stats=ds_meta.stats,
+            preprocessor_overrides={
+                "device_processor": {"device": "cuda"},
+                "normalizer_processor": {
+                    "stats": ds_meta.stats,
+                    "features": {
+                        **self.policy.config.input_features,
+                        **self.policy.config.output_features,
+                    },
+                    "norm_map": self.policy.config.normalization_mapping,
+                },
+            },
+            postprocessor_overrides={
+                "unnormalizer_processor": {
+                    "stats": ds_meta.stats,
+                    "features": self.policy.config.output_features,
+                    "norm_map": self.policy.config.normalization_mapping,
+                },
+            },
+        )
+
+        # Cache action quantile stats on GPU for fast unnormalization
+        action_stats = ds_meta.stats["action"]
+        self.action_q01 = torch.as_tensor(action_stats["q01"], dtype=torch.float32).to(self.device)
+        self.action_q99 = torch.as_tensor(action_stats["q99"], dtype=torch.float32).to(self.device)
+
+        # RTC state: track previous chunk for overlap guidance
+        self.prev_chunk = None  # normalized actions from last prediction
+        self.execution_horizon = self.policy.config.rtc_config.execution_horizon
+        self.steps_since_predict = 0
+
+        print("PI0.5 ready on GPU (RTC enabled, execution_horizon="
+              f"{self.execution_horizon}).")
 
     @modal.fastapi_endpoint(method="POST")
     def predict(self, payload: dict):
         import numpy as np
         import torch
-        from lerobot.utils.control_utils import predict_action
+        import base64
+        import cv2
+        from copy import copy
+        from lerobot.policies.utils import prepare_observation_for_inference
+
+        def decode_image(b64_str, shape=None):
+            img_bytes = base64.b64decode(b64_str)
+            if shape is not None:
+                return np.frombuffer(img_bytes, dtype=np.uint8).reshape(shape).copy()
+            else:
+                img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+                img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         observation = {}
-        state = np.array(payload["state"], dtype=np.float32)
-        observation["observation.state"] = state
+        observation["observation.state"] = np.array(payload["state"], dtype=np.float32)
 
-        if "image" in payload:
-            import base64
-            img_bytes = base64.b64decode(payload["image"])
-            img_array = np.frombuffer(img_bytes, dtype=np.uint8).reshape(
-                payload["image_shape"]
-            ).copy()
-            observation["observation.images.camera0"] = img_array.transpose(2, 0, 1).astype(np.float32) / 255.0
+        for cam_name in ["wrist", "top"]:
+            img_key = f"image_{cam_name}"
+            shape_key = f"image_{cam_name}_shape"
+            if img_key in payload:
+                shape = payload.get(shape_key)
+                img = decode_image(payload[img_key], shape)
+                observation[f"observation.images.{cam_name}"] = img
 
-        action_values = predict_action(
-            observation,
-            self.policy,
-            self.device,
-            self.policy.config.use_amp,
-            task=payload.get("task", TASK_NAME),
+        # Preprocess once, run model once, unnormalize the full chunk
+        observation = copy(observation)
+        observation = prepare_observation_for_inference(
+            observation, self.device,
+            task=payload.get("task", "Pour water from one plastic bottle into another."),
             robot_type=payload.get("robot_type", "omx_follower"),
         )
+        observation = self.preprocessor(observation)
 
-        return {"actions": action_values.cpu().numpy().tolist()}
+        # Single forward pass with RTC context
+        # (predict_action_chunk has @torch.no_grad; RTC internally uses enable_grad)
+        actions = self.policy.predict_action_chunk(
+            observation,
+            prev_chunk_left_over=self.prev_chunk,
+            inference_delay=self.steps_since_predict,
+        )
+        # actions shape: (1, chunk_size, action_dim) — normalized
+
+        # Store full normalized chunk for next RTC call
+        self.prev_chunk = actions.clone().detach()
+        self.steps_since_predict = self.execution_horizon
+
+        # Take only execution_horizon actions to send to client
+        actions_to_send = actions[:, :self.execution_horizon, :]
+
+        # Unnormalize: QUANTILES inverse → (norm + 1) * (q99 - q01) / 2 + q01
+        denom = self.action_q99 - self.action_q01
+        denom = torch.where(denom == 0, torch.tensor(1e-8, device=denom.device), denom)
+        actions_to_send = (actions_to_send + 1.0) * denom / 2.0 + self.action_q01
+
+        # (1, execution_horizon, action_dim) → (execution_horizon, action_dim)
+        return {"actions": actions_to_send.squeeze(0).cpu().numpy().tolist()}
 
     @modal.fastapi_endpoint(method="POST")
     def reset(self):
         self.policy.reset()
+        self.prev_chunk = None
+        self.steps_since_predict = 0
         return {"status": "ok"}
 
     @modal.fastapi_endpoint(method="GET")

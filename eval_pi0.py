@@ -25,7 +25,7 @@ import requests
 
 from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 
-from config import FPS, JOINT_NAMES, PI0_MODEL_REPO_ID, PI05_MODEL_REPO_ID, TASK_NAME
+from config import CAMERAS, FPS, JOINT_NAMES, PI0_MODEL_REPO_ID, PI05_MODEL_REPO_ID, TASK_NAME
 from control_utils import ensure_camera_size, maintain_fps
 from rerun_utils import init_rerun
 from robot_utils import create_follower, safe_disconnect
@@ -99,14 +99,15 @@ def _load_local_policy(checkpoint_path=None, use_pi05=False):
                 "mean": torch.zeros(NUM_JOINTS),
                 "std": torch.ones(NUM_JOINTS),
             },
-            "observation.images.front": {
+        }
+        for cam_name in CAMERAS:
+            dataset_stats[f"observation.images.{cam_name}"] = {
                 "mean": torch.zeros(NUM_CHANNELS, 1, 1),
                 "std": torch.ones(NUM_CHANNELS, 1, 1),
-            },
-            "action": {
-                "mean": torch.zeros(NUM_JOINTS),
-                "std": torch.ones(NUM_JOINTS),
-            },
+            }
+        dataset_stats["action"] = {
+            "mean": torch.zeros(NUM_JOINTS),
+            "std": torch.ones(NUM_JOINTS),
         }
         policy = PI0Policy.from_pretrained(repo_id, dataset_stats=dataset_stats)
 
@@ -135,6 +136,7 @@ def _predict_local(observation_frame, policy, device):
 # Remote inference (Modal)
 # ──────────────────────────────────────────────
 def _predict_remote(observation_frame, server_url, observation):
+    import cv2
     state = np.asarray(observation_frame["observation.state"]).tolist()
     payload = {
         "state": state,
@@ -142,10 +144,13 @@ def _predict_remote(observation_frame, server_url, observation):
         "robot_type": "omx_follower",
     }
 
-    if "front" in observation:
-        img = observation["front"]
-        payload["image"] = base64.b64encode(img.tobytes()).decode("ascii")
-        payload["image_shape"] = list(img.shape)
+    # Send camera images as JPEG (much smaller than raw bytes)
+    for cam_name in CAMERAS:
+        if cam_name in observation:
+            img = observation[cam_name]
+            bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            _, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            payload[f"image_{cam_name}"] = base64.b64encode(buf.tobytes()).decode("ascii")
 
     resp = requests.post(server_url, json=payload, timeout=30)
     resp.raise_for_status()
@@ -156,8 +161,8 @@ def main():
     parser = argparse.ArgumentParser(description="Pi0/Pi0.5 eval on OMX follower")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--local", action="store_true", help="Run policy locally")
-    mode.add_argument("--remote", type=str, metavar="URL",
-                      help="Modal server URL (e.g. https://your-app--pi0server-predict.modal.run)")
+    mode.add_argument("--remote", type=str, nargs="?", const="auto", metavar="URL",
+                      help="Use Modal GPU server. Omit URL to auto-deploy.")
     parser.add_argument("--pi05", action="store_true", help="Use PI0.5 instead of PI0")
     parser.add_argument("--checkpoint", type=str, metavar="PATH",
                         help="Local checkpoint path (overrides base model)")
@@ -171,13 +176,37 @@ def main():
         )
 
     if args.remote:
-        server_url = args.remote.rstrip("/")
+        if args.remote == "auto":
+            import subprocess
+            print("Auto-deploying Modal inference server...")
+            result = subprocess.run(
+                ["modal", "deploy", "serve_pi0_modal.py"],
+                capture_output=True, text=True, timeout=600,
+            )
+            print(result.stdout[-500:] if len(result.stdout) > 500 else result.stdout)
+            if result.returncode != 0:
+                print(f"Deploy failed:\n{result.stderr[-500:]}")
+                return
+            # Extract predict URL from output
+            for line in result.stdout.splitlines():
+                if "predict =>" in line:
+                    server_url = line.split("=>")[-1].strip()
+                    break
+            if not server_url:
+                print("Could not find predict URL in deploy output.")
+                return
+        else:
+            server_url = args.remote.rstrip("/")
+
         print(f"Using remote server: {server_url}")
         print("Warming up server (cold start can take ~60s)...")
         health_url = server_url.replace("-predict.", "-health.")
-        health = requests.get(health_url, timeout=120)
-        health.raise_for_status()
-        print("Remote server is ready.")
+        try:
+            health = requests.get(health_url, timeout=120)
+            health.raise_for_status()
+            print(f"Remote server is ready: {health.json()}")
+        except Exception as e:
+            print(f"Health check failed ({e}), proceeding anyway...")
 
     follower = _build_follower()
     dataset_features = {
@@ -186,11 +215,33 @@ def main():
     }
 
     print("Connecting follower arm...")
-    follower.connect(calibrate=False)
+    for attempt in range(1, 4):
+        try:
+            follower.connect(calibrate=False)
+            break
+        except (TimeoutError, RuntimeError) as e:
+            print(f"  Camera connect attempt {attempt}/3 failed: {e}")
+            if attempt == 3:
+                raise
+            follower.disconnect() if hasattr(follower, 'disconnect') else None
+            follower = _build_follower()
+            dataset_features = {
+                **hw_to_dataset_features(follower.action_features, "action", use_video=False),
+                **hw_to_dataset_features(follower.observation_features, "observation", use_video=False),
+            }
+            time.sleep(2)
 
     # ── Rerun setup ──
     model_name = "pi05" if args.pi05 else "pi0"
     init_rerun(f"omx_eval_{model_name}", save_rrd=True)
+
+    # Reset server state (clears stale RTC context)
+    if server_url:
+        reset_url = server_url.replace("-predict.", "-reset.")
+        try:
+            requests.post(reset_url, json={}, timeout=10)
+        except Exception:
+            pass
 
     try:
         print(f"Starting Pi0 eval in {START_DELAY_S}s. Press Ctrl+C to stop.")
@@ -210,9 +261,9 @@ def main():
 
             observation = follower.get_observation()
 
-            cam_key = "front"
-            if cam_key in observation:
-                ensure_camera_size(observation)
+            for cam_name in CAMERAS:
+                if cam_name in observation:
+                    ensure_camera_size(observation, key=cam_name)
 
             # Get next action — from queue or fresh prediction
             if not action_queue:
@@ -258,8 +309,9 @@ def main():
             rr.set_time_seconds("time", time.perf_counter() - run_start)
             rr.log("metrics/loop_hz", rr.Scalars(hz))
 
-            if cam_key in observation:
-                rr.log("camera/front", rr.Image(observation[cam_key]))
+            for cam_name in CAMERAS:
+                if cam_name in observation:
+                    rr.log(f"camera/{cam_name}", rr.Image(observation[cam_name]))
 
             for i, name in enumerate(JOINT_NAMES):
                 if "observation.state" in observation_frame:

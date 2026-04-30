@@ -31,6 +31,29 @@ def _load_gripper_inversion() -> dict:
     }
 
 
+def _write_calibration_safe(bus, calibration: dict) -> None:
+    """Write calibration to EEPROM, clamping range_min/range_max to [0, 4095].
+
+    In Extended Position mode the Min/Max_Position_Limit registers are ignored
+    by the motor firmware, but LeRobot's write_calibration() still writes them.
+    Dynamixel rejects values outside [0, 4095] for those registers, so we clamp
+    before writing while keeping the original calibration dict intact for
+    normalization (which CAN use extended ranges like [-4096, 4095]).
+    """
+    from lerobot.motors.motors_bus import MotorCalibration
+
+    clamped = {}
+    for motor, cal in calibration.items():
+        clamped[motor] = MotorCalibration(
+            id=cal.id,
+            drive_mode=cal.drive_mode,
+            homing_offset=cal.homing_offset,
+            range_min=max(0, cal.range_min),
+            range_max=min(4095, cal.range_max),
+        )
+    bus.write_calibration(clamped)
+
+
 class PatchedOmxLeader(OmxLeader):
     """OmxLeader that respects the gripper's calibration JSON and applies
     software-side gripper inversion if configured.
@@ -66,7 +89,7 @@ class PatchedOmxLeader(OmxLeader):
 
         if self.calibration:
             # JSON already has calibration — push it to EEPROM so they match.
-            self.bus.write_calibration(self.calibration)
+            _write_calibration_safe(self.bus, self.calibration)
         else:
             # First-ever connect, no JSON yet. Use stock defaults for body
             # joints, leave gripper at drive_mode=0 so calibrate_gripper.py
@@ -82,7 +105,7 @@ class PatchedOmxLeader(OmxLeader):
                     range_min=0,
                     range_max=4095,
                 )
-            self.bus.write_calibration(self.calibration)
+            _write_calibration_safe(self.bus, self.calibration)
 
         self._save_calibration()
 
@@ -156,7 +179,7 @@ class PatchedOmxFollower(OmxFollower):
             self.bus.write("Drive_Mode", motor, DriveMode.NON_INVERTED.value)
 
         if self.calibration:
-            self.bus.write_calibration(self.calibration)
+            _write_calibration_safe(self.bus, self.calibration)
         else:
             from lerobot.motors.motors_bus import MotorCalibration
 
@@ -169,7 +192,7 @@ class PatchedOmxFollower(OmxFollower):
                     range_min=0,
                     range_max=4095,
                 )
-            self.bus.write_calibration(self.calibration)
+            _write_calibration_safe(self.bus, self.calibration)
 
         self._save_calibration()
 
@@ -195,7 +218,6 @@ class PatchedOmxFollower(OmxFollower):
 
 from config import (
     CAMERA_HEIGHT,
-    CAMERA_INDEX,
     CAMERA_WIDTH,
     CAMERAS,
     FOLLOWER_PORT,
@@ -222,6 +244,7 @@ def create_follower(
                 fps=fps,
                 width=camera_width or CAMERA_WIDTH,
                 height=camera_height or CAMERA_HEIGHT,
+                warmup_s=5,
             )
     config = OmxFollowerConfig(port=port, id="omx_follower_arm", cameras=cameras)
     return PatchedOmxFollower(config)

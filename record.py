@@ -34,6 +34,8 @@ from control_utils import maintain_fps
 from rerun_utils import init_rerun
 from robot_utils import create_follower, create_leader, safe_disconnect
 
+USE_RERUN = False  # Set True to enable Rerun visualizer (adds latency)
+
 # ──────────────────────────────────────────────
 # Replay from buffer helper
 # ──────────────────────────────────────────────
@@ -71,14 +73,15 @@ def replay_from_buffer(action_buffer, state_buffer, action_names, state_names, f
 
             # Stream live camera to Rerun during replay
             observation = follower.get_observation()
-            rr.set_time("replay_step", sequence=idx)
-            for cam_name in CAMERAS:
-                if cam_name in observation:
-                    rr.log(f"camera/{cam_name}", rr.Image(observation[cam_name]))
-            for name in JOINT_NAMES:
-                key = f"{name}.pos"
-                if key in observation:
-                    rr.log(f"joints/{name}/replay", rr.Scalars(observation[key]))
+            if USE_RERUN:
+                rr.set_time("replay_step", sequence=idx)
+                for cam_name in CAMERAS:
+                    if cam_name in observation:
+                        rr.log(f"camera/{cam_name}", rr.Image(observation[cam_name]))
+                for name in JOINT_NAMES:
+                    key = f"{name}.pos"
+                    if key in observation:
+                        rr.log(f"joints/{name}/replay", rr.Scalars(observation[key]))
 
             print(f"  Replay frame {idx+1:4d}/{num_frames}", end="\r")
             maintain_fps(loop_start, fps)
@@ -155,9 +158,14 @@ def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
                 print(f"\n  Episode time limit reached ({EPISODE_DURATION_S}s).")
                 break
 
-            observation = robot.get_observation()
-            action = leader.get_action()
-            sent_action = robot.send_action(action)
+            try:
+                observation = robot.get_observation()
+                action = leader.get_action()
+                sent_action = robot.send_action(action)
+            except ConnectionError as e:
+                print(f"\n  ⚠️  USB glitch (retrying): {e}")
+                time.sleep(0.05)
+                continue
 
             # Buffer for potential replay
             action_buffer.append([sent_action[k] for k in sorted(sent_action)])
@@ -171,18 +179,19 @@ def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
             frame_count += 1
 
             # ── Rerun: stream camera + joints live ──
-            rr.set_time("step", sequence=rerun_step)
-            for cam_name in CAMERAS:
-                if cam_name in observation:
-                    rr.log(f"camera/{cam_name}", rr.Image(observation[cam_name]))
-            for i, name in enumerate(JOINT_NAMES):
-                obs_key = f"{name}.pos"
-                act_key = f"{name}.pos"
-                if obs_key in observation:
-                    rr.log(f"joints/{name}/state", rr.Scalars(observation[obs_key]))
-                if act_key in sent_action:
-                    rr.log(f"joints/{name}/action", rr.Scalars(sent_action[act_key]))
-            rerun_step += 1
+            if USE_RERUN:
+                rr.set_time("step", sequence=rerun_step)
+                for cam_name in CAMERAS:
+                    if cam_name in observation:
+                        rr.log(f"camera/{cam_name}", rr.Image(observation[cam_name]))
+                for i, name in enumerate(JOINT_NAMES):
+                    obs_key = f"{name}.pos"
+                    act_key = f"{name}.pos"
+                    if obs_key in observation:
+                        rr.log(f"joints/{name}/state", rr.Scalars(observation[obs_key]))
+                    if act_key in sent_action:
+                        rr.log(f"joints/{name}/action", rr.Scalars(sent_action[act_key]))
+                rerun_step += 1
 
             print(f"  Frame {frame_count:4d} | Time: {elapsed:6.1f}s", end="\r")
             maintain_fps(loop_start, FPS)
@@ -273,7 +282,8 @@ def main():
     soft_start(follower, leader)
 
     # ── Rerun setup (camera POV + joint plots) ──
-    init_rerun("omx_record", has_camera=USE_CAMERA, camera_primary=True, save_rrd=False)
+    if USE_RERUN:
+        init_rerun("omx_record", has_camera=USE_CAMERA, camera_primary=True, save_rrd=False)
 
     # Record episodes in a loop
     episode = 0

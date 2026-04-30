@@ -21,7 +21,7 @@ def ensure_camera_size(
     observation: dict,
     width: int = CAMERA_WIDTH,
     height: int = CAMERA_HEIGHT,
-    key: str = "front",
+    key: str = "wrist",
 ) -> dict:
     """Resize the camera frame in an observation dict if needed."""
     if key not in observation:
