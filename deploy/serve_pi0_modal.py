@@ -156,6 +156,11 @@ class Pi0Server:
                 img = decode_image(payload[img_key], shape)
                 observation[f"observation.images.{cam_name}"] = img
 
+        # Use client-reported steps_executed as inference_delay (how many
+        # actions the client consumed since the last prediction). Falls back
+        # to the stored counter for backward compatibility.
+        steps_executed = payload.get("steps_executed", self.steps_since_predict)
+
         # Preprocess once, run model once, unnormalize the full chunk
         observation = copy(observation)
         observation = prepare_observation_for_inference(
@@ -165,18 +170,24 @@ class Pi0Server:
         )
         observation = self.preprocessor(observation)
 
+        # Slice prev_chunk by actual steps_executed so leftover[0] aligns
+        # temporally with new_chunk[0] (the action about to be executed now).
+        prev_left_over = None
+        if self.prev_chunk is not None:
+            prev_left_over = self.prev_chunk[:, steps_executed:, :]
+
         # Single forward pass with RTC context
         # (predict_action_chunk has @torch.no_grad; RTC internally uses enable_grad)
         actions = self.policy.predict_action_chunk(
             observation,
-            prev_chunk_left_over=self.prev_chunk,
-            inference_delay=self.steps_since_predict,
+            prev_chunk_left_over=prev_left_over,
+            inference_delay=steps_executed,
         )
         # actions shape: (1, chunk_size, action_dim) — normalized
 
-        # Store only the unexecuted leftover for next RTC guidance
-        self.prev_chunk = actions[:, self.execution_horizon:, :].clone().detach()
-        self.steps_since_predict = self.execution_horizon
+        # Store the full normalized chunk; we'll slice by actual delay at next call
+        self.prev_chunk = actions.clone().detach()
+        self.steps_since_predict = 0
 
         # Take only execution_horizon actions to send to client
         actions_to_send = actions[:, :self.execution_horizon, :]
