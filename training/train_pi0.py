@@ -68,7 +68,7 @@ SAVE_FREQ = 5_000
 SEED = 1000
 
 # PI0.5 finetuning hyperparameters
-CHUNK_SIZE = 50
+CHUNK_SIZE = 100
 N_ACTION_STEPS = 50
 LEARNING_RATE = 2.5e-5
 TRAIN_EXPERT_ONLY = True       # freeze PaliGemma VLM, train only action expert
