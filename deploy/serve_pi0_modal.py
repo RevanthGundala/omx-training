@@ -169,7 +169,7 @@ class Pi0Server:
         # (predict_action_chunk has @torch.no_grad; RTC internally uses enable_grad)
         actions = self.policy.predict_action_chunk(
             observation,
-            prev_chunk_left_over=None,
+            prev_chunk_left_over=self.prev_chunk,
             inference_delay=self.steps_since_predict,
         )
         # actions shape: (1, chunk_size, action_dim) — normalized
