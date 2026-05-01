@@ -46,14 +46,12 @@ def show_camera_preview(observation):
         return
     panels = []
     for cam_name in CAMERAS:
-        key = f"observation.images.{cam_name}"
-        if key in observation:
-            img = observation[key]
-            if isinstance(img, np.ndarray):
-                if img.ndim == 3 and img.shape[2] == 3:
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                cv2.putText(img, cam_name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                panels.append(img)
+        img = observation.get(cam_name)
+        if img is not None and isinstance(img, np.ndarray):
+            if img.ndim == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            cv2.putText(img, cam_name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            panels.append(img)
     if panels:
         combined = np.hstack(panels) if len(panels) > 1 else panels[0]
         cv2.imshow("Camera Preview", combined)
