@@ -189,15 +189,14 @@ class Pi0Server:
         self.prev_chunk = actions.clone().detach()
         self.steps_since_predict = 0
 
-        # Take only execution_horizon actions to send to client
-        actions_to_send = actions[:, :self.execution_horizon, :]
-
-        # Unnormalize: QUANTILES inverse → (norm + 1) * (q99 - q01) / 2 + q01
+        # Unnormalize the full chunk: QUANTILES inverse → (norm + 1) * (q99 - q01) / 2 + q01
+        # Send ALL chunk_size actions so the client has a ~1.7s buffer at 30Hz.
+        # execution_horizon controls RTC guidance weights, not output truncation.
         denom = self.action_q99 - self.action_q01
         denom = torch.where(denom == 0, torch.tensor(1e-8, device=denom.device), denom)
-        actions_to_send = (actions_to_send + 1.0) * denom / 2.0 + self.action_q01
+        actions_to_send = (actions + 1.0) * denom / 2.0 + self.action_q01
 
-        # (1, execution_horizon, action_dim) → (execution_horizon, action_dim)
+        # (1, chunk_size, action_dim) → (chunk_size, action_dim)
         return {"actions": actions_to_send.squeeze(0).cpu().numpy().tolist()}
 
     @modal.fastapi_endpoint(method="POST")
