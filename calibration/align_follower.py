@@ -70,6 +70,26 @@ def center(name: str, bus) -> dict:
     body_motors = [m for m in bus.motors if m != "gripper"]
     offsets = bus.set_half_turn_homings(body_motors)
     cal = bus.read_calibration()
+
+    # Widen range for body joints so normalization doesn't clamp in Extended
+    # Position mode.  set_half_turn_homings() centres each motor at 2047, but
+    # the default range [0, 4095] only covers one revolution (±180°).  Joints
+    # that can physically exceed ±180° from centre will saturate and the
+    # follower will stop tracking.  Using [-2048, 6143] gives ±270° of
+    # headroom.  _write_calibration_safe() still clamps EEPROM writes to
+    # [0, 4095] (those registers are ignored in Extended Position mode anyway).
+    from lerobot.motors.motors_bus import MotorCalibration
+
+    for motor in body_motors:
+        c = cal[motor]
+        cal[motor] = MotorCalibration(
+            id=c.id,
+            drive_mode=c.drive_mode,
+            homing_offset=c.homing_offset,
+            range_min=-2048,
+            range_max=6143,
+        )
+
     for motor, off in offsets.items():
         c = cal[motor]
         print(f"  {motor:<16} homing={off:>+6}  range=[{c.range_min}, {c.range_max}]")
