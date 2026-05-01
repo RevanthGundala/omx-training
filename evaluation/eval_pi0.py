@@ -86,9 +86,9 @@ class RTCActionQueue:
             if self._queue:
                 action = self._queue.popleft()
                 self._last_action = action
+                self._steps_since_replace += 1
             else:
                 action = self._last_action  # hold position
-            self._steps_since_replace += 1
             return action
 
     def qsize(self) -> int:
