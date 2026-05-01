@@ -23,6 +23,7 @@ from pathlib import Path
 
 import cv2
 import cv2
+import multiprocessing as mp
 import numpy as np
 import rerun as rr
 from huggingface_hub import HfApi
@@ -40,22 +41,78 @@ USE_RERUN = False  # Set True to enable Rerun visualizer (adds latency)
 SHOW_CAMERAS = True  # Live camera preview via OpenCV (minimal latency)
 
 
-def show_camera_preview(observation):
-    """Display camera feeds side-by-side in an OpenCV window."""
-    if not SHOW_CAMERAS:
-        return
-    panels = []
-    for cam_name in CAMERAS:
-        img = observation.get(cam_name)
-        if img is not None and isinstance(img, np.ndarray):
-            if img.ndim == 3 and img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            cv2.putText(img, cam_name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            panels.append(img)
-    if panels:
-        combined = np.hstack(panels) if len(panels) > 1 else panels[0]
-        cv2.imshow("Camera Preview", combined)
+def _camera_display_worker(frame_queue: mp.Queue, stop_event):
+    """Subprocess that displays camera frames. Runs in its own process to avoid
+    macOS segfaults from OpenCV GUI + pynput threading conflicts."""
+    while not stop_event.is_set():
+        try:
+            frame = frame_queue.get(timeout=0.1)
+        except Exception:
+            continue
+        if frame is None:
+            break
+        cv2.imshow("Camera Preview", frame)
         cv2.waitKey(1)
+    cv2.destroyAllWindows()
+
+
+class CameraPreview:
+    """Manages a separate process for camera display."""
+    def __init__(self):
+        self._proc = None
+        self._queue = None
+        self._stop = None
+
+    def start(self):
+        if not SHOW_CAMERAS:
+            return
+        self._stop = mp.Event()
+        self._queue = mp.Queue(maxsize=2)
+        self._proc = mp.Process(target=_camera_display_worker,
+                                args=(self._queue, self._stop), daemon=True)
+        self._proc.start()
+
+    def show(self, observation):
+        if not SHOW_CAMERAS or self._proc is None or not self._proc.is_alive():
+            return
+        panels = []
+        for cam_name in CAMERAS:
+            img = observation.get(cam_name)
+            if img is not None and isinstance(img, np.ndarray):
+                if img.ndim == 3 and img.shape[2] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                cv2.putText(img, cam_name, (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                panels.append(img)
+        if panels:
+            combined = np.hstack(panels) if len(panels) > 1 else panels[0]
+            # Drop old frame if display is behind
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                except Exception:
+                    pass
+            try:
+                self._queue.put_nowait(combined)
+            except Exception:
+                pass
+
+    def stop(self):
+        if self._proc is None:
+            return
+        self._stop.set()
+        try:
+            self._queue.put_nowait(None)
+        except Exception:
+            pass
+        self._proc.join(timeout=2)
+        if self._proc.is_alive():
+            self._proc.terminate()
+        self._proc = None
+
+
+# Global camera preview instance
+camera_preview = CameraPreview()
 
 # ──────────────────────────────────────────────
 # Replay from buffer helper
@@ -188,7 +245,7 @@ def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
                 time.sleep(0.05)
                 continue
 
-            show_camera_preview(observation)
+            camera_preview.show(observation)
 
             # Buffer for potential replay
             action_buffer.append([sent_action[k] for k in sorted(sent_action)])
@@ -308,12 +365,21 @@ def main():
     if USE_RERUN:
         init_rerun("omx_record", has_camera=USE_CAMERA, camera_primary=True, save_rrd=False)
 
+    # Start camera preview process
+    camera_preview.start()
+
     # Record episodes in a loop
     episode = 0
     rerun_step = 0
     try:
         while episode < NUM_EPISODES:
-            result = record_one_episode(follower, leader, dataset, dataset.num_episodes, rerun_step)
+            try:
+                result = record_one_episode(follower, leader, dataset, dataset.num_episodes, rerun_step)
+            except Exception as e:
+                print(f"\n  ⚠️  Episode error: {e}")
+                import traceback; traceback.print_exc()
+                dataset.clear_episode_buffer()
+                continue
             frame_count, action_buf, state_buf, action_names, state_names, rerun_step = result
 
             if frame_count == 0:
@@ -323,7 +389,10 @@ def main():
 
             if frame_count < 0:
                 print("  ← Episode DISCARDED.")
-                dataset.clear_episode_buffer()
+                try:
+                    dataset.clear_episode_buffer()
+                except Exception as e:
+                    print(f"  ⚠️  clear_episode_buffer error: {e}")
                 continue
 
             # ── Review phase: replay/save/discard ──
@@ -350,7 +419,7 @@ def main():
                     action = leader.get_action()
                     follower.send_action(action)
                     observation = follower.get_observation()
-                    show_camera_preview(observation)
+                    camera_preview.show(observation)
 
                     if replay_ep.is_set():
                         replay_ep.clear()
@@ -390,7 +459,7 @@ def main():
                     action = leader.get_action()
                     follower.send_action(action)
                     observation = follower.get_observation()
-                    show_camera_preview(observation)
+                    camera_preview.show(observation)
                     maintain_fps(time.perf_counter(), FPS)
             except KeyboardInterrupt:
                 print("\n\n  Stopping recording.")
@@ -400,10 +469,9 @@ def main():
         print("\n\nRecording interrupted.")
 
     finally:
+        camera_preview.stop()
         safe_disconnect(follower)
         safe_disconnect(leader)
-        if SHOW_CAMERAS:
-            cv2.destroyAllWindows()
 
     # Push to hub (optional)
     if PUSH_TO_HUB:
