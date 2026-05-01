@@ -202,12 +202,16 @@ def main():
                 break
             time.sleep(0.01)
 
+        first_call = True
         while not stop_event.is_set():
             # Snapshot the freshest observation and steps consumed
             with obs_lock:
                 obs_snapshot = {k: v for k, v in latest_observation.items()}
                 frame_snapshot = latest_observation_frame
             steps_executed = action_queue.steps_since_replace
+
+            if first_call:
+                print("Sending first inference request to server...")
 
             inference_running.set()
             try:
@@ -216,6 +220,9 @@ def main():
                 )
                 # Atomically read consumed steps and swap the queue
                 action_queue.replace_atomic(actions)
+                if first_call:
+                    print(f"First inference returned {len(actions)} actions. Robot active!")
+                    first_call = False
             except Exception as e:
                 print(f"\n⚠ Inference error: {e}")
             finally:
@@ -227,9 +234,9 @@ def main():
     try:
         print(f"Starting Pi0 eval in {START_DELAY_S}s. Press Ctrl+C to stop.")
         for remaining in range(START_DELAY_S, 0, -1):
-            print(f"  {remaining}...", end="\r")
+            print(f"  {remaining}...")
             time.sleep(1)
-        print(" " * 40, end="\r")
+        print("Running! Waiting for first inference...")
 
         run_start = time.perf_counter()
         step = 0
