@@ -197,7 +197,14 @@ class Pi0Server:
         actions_to_send = (actions + 1.0) * denom / 2.0 + self.action_q01
 
         # (1, chunk_size, action_dim) → (chunk_size, action_dim)
-        return {"actions": actions_to_send.squeeze(0).cpu().numpy().tolist()}
+        return {
+            "actions": actions_to_send.squeeze(0).cpu().numpy().tolist(),
+            "debug": {
+                "inference_delay": steps_executed,
+                "prev_chunk_exists": self.prev_chunk is not None,
+                "prev_left_over_shape": list(prev_left_over.shape) if prev_left_over is not None else None,
+            },
+        }
 
     @modal.fastapi_endpoint(method="POST")
     def reset(self):

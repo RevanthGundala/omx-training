@@ -67,11 +67,13 @@ class RTCActionQueue:
                 self._queue.append(row)
             self._steps_since_replace = 0
 
-    def replace_atomic(self, actions: np.ndarray):
+    def replace_atomic(self, actions: np.ndarray) -> int:
         """Atomically read steps_since_replace and replace the queue.
 
         Avoids a race where the main loop's get() increments the counter
         between a separate read and a subsequent replace() call.
+
+        Returns the number of steps that were skipped (the actual delay).
         """
         with self._lock:
             skip = max(0, min(self._steps_since_replace, len(actions)))
@@ -79,6 +81,7 @@ class RTCActionQueue:
             for row in actions[skip:]:
                 self._queue.append(row)
             self._steps_since_replace = 0
+            return skip
 
     def get(self) -> np.ndarray | None:
         """Pop the next action.  Returns last-sent action if empty."""
@@ -128,7 +131,13 @@ def _predict_remote(observation_frame, server_url, observation, steps_executed: 
 
     resp = requests.post(server_url, json=payload, timeout=30)
     resp.raise_for_status()
-    return np.array(resp.json()["actions"], dtype=np.float32)
+    data = resp.json()
+    if "debug" in data:
+        dbg = data["debug"]
+        print(f"\n  [server] inference_delay={dbg.get('inference_delay')}, "
+              f"prev_chunk={dbg.get('prev_chunk_exists')}, "
+              f"leftover_shape={dbg.get('prev_left_over_shape')}")
+    return np.array(data["actions"], dtype=np.float32)
 
 
 def main():
@@ -203,12 +212,18 @@ def main():
             time.sleep(0.01)
 
         first_call = True
+        last_round_trip_delay = 0  # estimate for next inference_delay
         while not stop_event.is_set():
             # Snapshot the freshest observation and steps consumed
             with obs_lock:
                 obs_snapshot = {k: v for k, v in latest_observation.items()}
                 frame_snapshot = latest_observation_frame
-            steps_executed = action_queue.steps_since_replace
+
+            # Use the previous round-trip's actual delay as the best estimate
+            # of how many steps will be consumed during THIS round-trip.
+            # Also read current steps consumed for the prev_chunk slice.
+            steps_consumed_now = action_queue.steps_since_replace
+            estimated_delay = steps_consumed_now + last_round_trip_delay
 
             if first_call:
                 print("Sending first inference request to server...")
@@ -216,10 +231,11 @@ def main():
             inference_running.set()
             try:
                 actions = _predict_remote(
-                    frame_snapshot, server_url, obs_snapshot, steps_executed,
+                    frame_snapshot, server_url, obs_snapshot, estimated_delay,
                 )
                 # Atomically read consumed steps and swap the queue
-                action_queue.replace_atomic(actions)
+                actual_skip = action_queue.replace_atomic(actions)
+                last_round_trip_delay = actual_skip
                 if first_call:
                     print(f"First inference returned {len(actions)} actions. Robot active!")
                     first_call = False
