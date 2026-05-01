@@ -13,10 +13,10 @@ This documents every problem we hit getting the ROBOTIS OpenManipulator-X (OMX) 
 After a fresh setup or if things get messed up, run these in order:
 
 ```bash
-uv run python align_follower.py       # 1. Align body joints
-uv run python calibrate_gripper.py    # 2. Calibrate gripper range + inversion
-uv run python check_calibration.py    # 3. Verify (body joints ~0 diff)
-uv run python teleop.py              # 4. Teleoperate
+uv run python -m calibration.align_follower       # 1. Align body joints
+uv run python -m calibration.calibrate_gripper    # 2. Calibrate gripper range + inversion
+uv run python -m calibration.check_calibration    # 3. Verify (body joints ~0 diff)
+uv run python -m control.teleop                   # 4. Teleoperate
 ```
 
 ---
@@ -29,7 +29,7 @@ Leader and follower report different angles for the same physical pose. Teleop d
 ### Root Cause
 LeRobot's first-connect `calibrate()` writes `Homing_Offset=0` to every motor's EEPROM, permanently wiping the factory per-unit calibration values that ROBOTIS set to compensate for mounting angle variance between units.
 
-### Fix: `align_follower.py`
+### Fix: `calibration/align_follower.py`
 1. Pose both arms identically by hand.
 2. Calls `bus.set_half_turn_homings()` on **body joints only** (not gripper) — sets each motor's `Homing_Offset` so `Present_Position == 2047` at the current pose.
 3. Saves to calibration JSON so `is_calibrated == True` on next connect.
@@ -46,7 +46,7 @@ Body joints track perfectly, but follower gripper barely moves when leader trigg
 ### Root Cause
 Body joints use most of the 0–4095 encoder range; centering with `Homing_Offset` is enough. But the gripper jaws only span ~1300 ticks (out of 4096). With the default `range_min=0, range_max=4095`, LeRobot's normalization formula (`percent = (raw - min) / (max - min) * 100`) maps the gripper's actual ~1300-tick physical range into a tiny ~30% slice of the 0–100% output. A full leader squeeze might only produce a 30% change → follower barely moves.
 
-### Fix: `calibrate_gripper.py`
+### Fix: `calibration/calibrate_gripper.py`
 Manually measures the actual encoder positions at fully-open and fully-closed for both grippers, then writes those as `range_min` / `range_max`. Now 0% = jaws closed, 100% = jaws open (full range utilization).
 
 ---
@@ -105,7 +105,7 @@ Stock `OmxLeader.configure()` (runs on every `connect()`) writes:
 This ignores whatever the calibration JSON says.
 
 ### Fix: `PatchedOmxLeader.configure()` Override
-Reads `drive_mode` and `homing_offset` from `self.calibration["gripper"]` (the JSON) instead of hardcoding values. Whatever `calibrate_gripper.py` saved is what gets written.
+Reads `drive_mode` and `homing_offset` from `self.calibration["gripper"]` (the JSON) instead of hardcoding values. Whatever `calibration/calibrate_gripper.py` saved is what gets written.
 
 ---
 
@@ -131,20 +131,20 @@ Additionally, the `range_max` was measured during calibration with torque OFF (u
 
 | Script | Purpose |
 |---|---|
-| `align_follower.py` | Align body joints (not gripper) between leader and follower |
-| `calibrate_gripper.py` | Measure gripper range + direction, save calibration + inversion flags |
-| `check_calibration.py` | Read-only snapshot comparing leader vs follower positions |
-| `inspect_state.py` | Read-only deep diagnostic: EEPROM vs JSON for every motor |
-| `teleop.py` | Main teleoperation loop |
-| `diagnose_gripper_range.py` | Live encoder monitor to find raw gripper range by hand |
-| `diagnose_wrist_roll.py` | Check wrist_roll centering and suggest homing_offset fix |
-| `sweep_leader_current.py` | Sweep Goal_Current values to find usable trigger resistance |
+| `calibration/align_follower.py` | Align body joints (not gripper) between leader and follower |
+| `calibration/calibrate_gripper.py` | Measure gripper range + direction, save calibration + inversion flags |
+| `calibration/check_calibration.py` | Read-only snapshot comparing leader vs follower positions |
+| `diagnostics/inspect_state.py` | Read-only deep diagnostic: EEPROM vs JSON for every motor |
+| `control/teleop.py` | Main teleoperation loop |
+| `diagnostics/diagnose_gripper_range.py` | Live encoder monitor to find raw gripper range by hand |
+| `diagnostics/diagnose_wrist_roll.py` | Check wrist_roll centering and suggest homing_offset fix |
+| `diagnostics/sweep_leader_current.py` | Sweep Goal_Current values to find usable trigger resistance |
 
 ### Core Module
 
 | File | Purpose |
 |---|---|
-| `robot_utils.py` | `PatchedOmxLeader`, `PatchedOmxFollower`, `_write_calibration_safe()`, `create_leader()`, `create_follower()`, gripper inversion loading |
+| `utils/robot_utils.py` | `PatchedOmxLeader`, `PatchedOmxFollower`, `_write_calibration_safe()`, `create_leader()`, `create_follower()`, gripper inversion loading |
 
 ### Calibration Data (on disk)
 
@@ -164,7 +164,7 @@ Additionally, the `range_max` was measured during calibration with torque OFF (u
 > inversion). If `range_min` equals the physical stop, the motor sits exactly
 > at the stop and mechanical backlash leaves a visible jaw gap. Setting
 > `range_min` ~50 ticks past the physical stop makes the motor push into the
-> stop, eliminating the gap. `calibrate_gripper.py` applies 5% closed-end
+> stop, eliminating the gap. `calibration/calibrate_gripper.py` applies 5% closed-end
 > padding automatically.
 
 ---
@@ -210,7 +210,7 @@ During teleop, rotating the leader wrist_roll hits the normalized `-100` floor a
    ```
    For our leader: `0 - 1116 = -1116`. For our follower: `0 - 1095 = -1084` (was already correct).
 
-3. **Added `_write_calibration_safe()` helper** in `robot_utils.py`. Dynamixel `Min_Position_Limit` / `Max_Position_Limit` EEPROM registers only accept `[0, 4095]`, but in Extended Position mode they're ignored by the firmware anyway. LeRobot's `write_calibration()` still tries to write them, so `_write_calibration_safe()` clamps range values to `[0, 4095]` for the EEPROM write while keeping the extended range in the in-memory calibration dict for normalization.
+3. **Added `_write_calibration_safe()` helper** in `utils/robot_utils.py`. Dynamixel `Min_Position_Limit` / `Max_Position_Limit` EEPROM registers only accept `[0, 4095]`, but in Extended Position mode they're ignored by the firmware anyway. LeRobot's `write_calibration()` still tries to write them, so `_write_calibration_safe()` clamps range values to `[0, 4095]` for the EEPROM write while keeping the extended range in the in-memory calibration dict for normalization.
 
 ### Diagnostic
 Run `uv run python diagnose_wrist_roll.py` to check where each arm's wrist_roll rests in the normalized range. If normalized isn't near 0, use the suggested `homing_offset`.
@@ -227,14 +227,14 @@ Run `uv run python diagnose_wrist_roll.py` to check where each arm's wrist_roll 
 
 | Script | Purpose |
 |---|---|
-| `align_follower.py` | Align body joints (not gripper) between leader and follower |
-| `calibrate_gripper.py` | Measure gripper range + direction, save calibration + inversion flags |
-| `check_calibration.py` | Read-only snapshot comparing leader vs follower positions |
-| `inspect_state.py` | Read-only deep diagnostic: EEPROM vs JSON for every motor |
-| `teleop.py` | Main teleoperation loop |
-| `diagnose_gripper_range.py` | Live encoder monitor to find raw gripper range by hand |
-| `diagnose_wrist_roll.py` | Check wrist_roll centering and suggest homing_offset fix |
-| `sweep_leader_current.py` | Sweep Goal_Current values to find usable trigger resistance |
+| `calibration/align_follower.py` | Align body joints (not gripper) between leader and follower |
+| `calibration/calibrate_gripper.py` | Measure gripper range + direction, save calibration + inversion flags |
+| `calibration/check_calibration.py` | Read-only snapshot comparing leader vs follower positions |
+| `diagnostics/inspect_state.py` | Read-only deep diagnostic: EEPROM vs JSON for every motor |
+| `control/teleop.py` | Main teleoperation loop |
+| `diagnostics/diagnose_gripper_range.py` | Live encoder monitor to find raw gripper range by hand |
+| `diagnostics/diagnose_wrist_roll.py` | Check wrist_roll centering and suggest homing_offset fix |
+| `diagnostics/sweep_leader_current.py` | Sweep Goal_Current values to find usable trigger resistance |
 
 ---
 

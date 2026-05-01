@@ -9,47 +9,63 @@ cd /Users/revanthgundala/projects/omx-training
 uv sync
 ```
 
+## Project Structure
+
+```
+calibration/     — Gripper & joint calibration scripts
+control/         — Teleoperation
+data/            — Recording, replay, visualization, dataset tools
+deploy/          — Modal & Vast.ai cloud training/serving
+diagnostics/     — Motor diagnostics & debugging
+evaluation/      — Local policy evaluation (ACT, PI0.5)
+training/        — Local training scripts (ACT, PI0.5)
+utils/           — Shared config, robot helpers, control utils
+tests/           — Smoke tests
+rlt/             — Experimental RL modules
+outputs/         — Checkpoints & Rerun logs
+```
+
 ## Scripts
 
-### 1. Teleoperate — `teleop.py`
+### 1. Teleoperate — `control/teleop.py`
 
 Move the leader arm by hand and the follower mirrors your movements.
 
 ```bash
-uv run python teleop.py
+uv run python -m control.teleop
 ```
 
 Press `Ctrl+C` to stop.
 
-### 2. Record Data — `record.py`
+### 2. Record Data — `data/record.py`
 
 Record teleoperation episodes to a local dataset.
 
 ```bash
-uv run python record.py
+uv run python -m data.record
 ```
 
 - Press `→` (right arrow) to end an episode and start the next one
 - Press `Ctrl+C` to stop recording entirely
 - Data is saved locally to `~/.cache/huggingface/lerobot/<repo_id>/`
 
-### 3. Visualize Data — `visualize.py`
+### 3. Visualize Data — `data/visualize.py`
 
 View recorded episodes in the Rerun viewer (camera + joint plots side by side).
 
 ```bash
-uv run python visualize.py
+uv run python -m data.visualize
 ```
 
-### 4. Train ACT Policy — `train.py`
+### 4. Train ACT Policy — `training/train.py`
 
 Train locally on a CUDA/MPS machine:
 
 ```bash
-python train.py
+uv run python -m training.train
 ```
 
-### 5. Train on Vast.ai — `train_vastai.py`
+### 5. Train on Vast.ai — `deploy/train_vastai.py`
 
 Launch training on a Vast.ai GPU (for example an RTX 4090 at ~50 min, ~$0.40):
 
@@ -59,10 +75,10 @@ export HF_TOKEN="your-token"      # from https://huggingface.co/settings/tokens
 # Optional overrides when changing GPU families or images:
 export OMX_GPU_NAME="RTX_4090"
 export OMX_VAST_IMAGE="pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel"
-uv run python train_vastai.py
+uv run python -m deploy.train_vastai
 ```
 
-The script automatically launches an instance, uploads `train.py`, runs
+The script automatically launches an instance, uploads `training/train.py`, runs
 training, streams logs, and leaves the instance running so you can download the
 checkpoints before destroying it.
 
@@ -71,12 +87,12 @@ offer and temporarily skips recently failed hosts using a cache at
 `~/.cache/omx-training/vastai_failed_offers.json`. It also runs a CUDA
 preflight before setup so an incompatible GPU/image combination fails fast.
 
-### 6. Live Eval — `eval.py`
+### 6. Live Eval — `evaluation/eval.py`
 
 Run a saved checkpoint directly on the follower arm:
 
 ```bash
-uv run python eval.py
+uv run python -m evaluation.eval
 ```
 
 By default it loads:
@@ -94,29 +110,30 @@ continues to act from joint state only. To make camera frames affect the
 actions, the checkpoint itself must be trained with `observation.images.*`
 inputs.
 
-### 7. Smoke Test — `smoke_test.py`
+### 7. Smoke Test — `tests/smoke_test.py`
 
 Run a lightweight preflight before spending on Vast.ai:
 
 ```bash
-uv run python smoke_test.py
+uv run python -m tests.smoke_test
 ```
 
 This checks the dataset metadata against the Hugging Face repo tree, validates
-the `train.py` config on CPU, and verifies that `train_vastai.py` still
+the `training/train.py` config on CPU, and verifies that `deploy/train_vastai.py` still
 generates the expected Vast onstart script.
 
 To also run a real 1-step local training smoke test:
 
 ```bash
-uv run python smoke_test.py --train-step
+uv run python -m tests.smoke_test --train-step
 ```
 
 ## Configuration
 
-Each script has a **Configuration** section at the top of the file. For
-`train_vastai.py`, you can also override the target GPU and base image with
-`OMX_GPU_NAME` and `OMX_VAST_IMAGE` instead of editing the file.
+Each script has a **Configuration** section at the top of the file. Shared
+settings live in `utils/config.py`. For `deploy/train_vastai.py`, you can also
+override the target GPU and base image with `OMX_GPU_NAME` and `OMX_VAST_IMAGE`
+instead of editing the file.
 
 ## Finding Your Serial Ports
 

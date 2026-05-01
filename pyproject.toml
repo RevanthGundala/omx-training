@@ -20,4 +20,4 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["."]
+packages = ["utils", "calibration", "control", "data", "deploy", "diagnostics", "evaluation", "training", "rlt", "tests"]

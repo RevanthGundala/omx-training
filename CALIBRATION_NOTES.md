@@ -33,7 +33,7 @@ Since the factory EEPROM values are gone and not backed up anywhere recoverable:
 2. **Save it to the follower calibration JSON.** `~/.cache/huggingface/lerobot/calibration/robots/omx_follower/omx_follower_arm.json`.
 3. **Reconnect.** LeRobot writes the new offset into the motor EEPROM. Done.
 
-That's what `align_follower.py` automates.
+That's what `calibration/align_follower.py` automates.
 
 ## Optional: contact ROBOTIS
 
