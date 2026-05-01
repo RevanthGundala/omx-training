@@ -82,7 +82,7 @@ class Pi0Server:
                 pretrained_path=str(checkpoint_path),
                 device="cuda",
                 chunk_size=100,
-                n_action_steps=100,
+                n_action_steps=50,
                 rtc_config=RTCConfig(enabled=True, execution_horizon=40),
             ),
             ds_meta=ds_meta,
