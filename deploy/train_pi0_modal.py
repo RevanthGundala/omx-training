@@ -9,10 +9,10 @@ Usage:
     modal token new
 
     # Train with defaults (A10G, 10k steps, expert-only):
-    modal run train_pi0_modal.py
+    modal run deploy/train_pi0_modal.py
 
     # Custom GPU and steps:
-    modal run train_pi0_modal.py --gpu a100 --training-steps 20000
+    modal run deploy/train_pi0_modal.py --gpu a100 --training-steps 20000
 
     # Download checkpoints after training:
     modal volume get omx-pi0-training-logs outputs/ outputs/

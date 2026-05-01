@@ -10,10 +10,10 @@ Usage:
     modal token new
 
     # Train with defaults (A10G, 50k steps):
-    modal run train_modal.py
+    modal run deploy/train_modal.py
 
     # Custom GPU and steps:
-    modal run train_modal.py --gpu a100 --training-steps 100000
+    modal run deploy/train_modal.py --gpu a100 --training-steps 100000
 
     # Download checkpoints after training:
     modal volume get omx-act-training-logs outputs/ outputs/

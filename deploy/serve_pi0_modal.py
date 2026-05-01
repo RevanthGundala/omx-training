@@ -4,8 +4,8 @@ serve_pi0_modal.py — Modal GPU inference server for PI0.5 finetuned policy.
 Loads the finetuned PI0.5 checkpoint from the training volume and exposes
 /predict, /reset, and /health endpoints.
 
-Deploy:  modal deploy serve_pi0_modal.py
-Dev:     modal serve serve_pi0_modal.py
+Deploy:  modal deploy deploy/serve_pi0_modal.py
+Dev:     modal serve deploy/serve_pi0_modal.py
 """
 
 import modal
