@@ -81,8 +81,8 @@ class Pi0Server:
             cfg=PI05Config(
                 pretrained_path=str(checkpoint_path),
                 device="cuda",
-                chunk_size=50,
-                n_action_steps=50,
+                chunk_size=100,
+                n_action_steps=100,
                 rtc_config=RTCConfig(enabled=True, execution_horizon=40),
             ),
             ds_meta=ds_meta,
