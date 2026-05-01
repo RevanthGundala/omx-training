@@ -242,6 +242,7 @@ def main():
         step = 0
         frozen_joint_targets: dict[str, float] = {}
         observation_frame = None
+        debug_log = open("outputs/eval_debug.csv", "w")
 
         while True:
             loop_start = time.perf_counter()
@@ -279,6 +280,15 @@ def main():
             loop_dt = time.perf_counter() - loop_start
             hz = 1.0 / loop_dt if loop_dt > 0 else float("inf")
 
+            # ── Debug CSV log ──
+            if step == 0:
+                joint_headers = ",".join(JOINT_NAMES)
+                debug_log.write(f"step,hz,qsize,{joint_headers}\n")
+            vals = ",".join(f"{action_values[i]:.4f}" for i in range(len(JOINT_NAMES)))
+            debug_log.write(f"{step},{hz:.1f},{action_queue.qsize()},{vals}\n")
+            if step % 30 == 0:
+                debug_log.flush()
+
             # ── Rerun logging ──
             rr.set_time_sequence("step", step)
             rr.set_time_seconds("time", time.perf_counter() - run_start)
@@ -311,6 +321,8 @@ def main():
     except KeyboardInterrupt:
         print("\n\nStopping Pi0 eval...")
     finally:
+        debug_log.close()
+        print(f"Debug log saved to outputs/eval_debug.csv")
         stop_event.set()
         inference_thread.join(timeout=5)
         safe_disconnect(follower)

@@ -83,7 +83,7 @@ class Pi0Server:
                 device="cuda",
                 chunk_size=50,
                 n_action_steps=50,
-                rtc_config=RTCConfig(enabled=True, execution_horizon=10),
+                rtc_config=RTCConfig(enabled=True, execution_horizon=40),
             ),
             ds_meta=ds_meta,
         )
