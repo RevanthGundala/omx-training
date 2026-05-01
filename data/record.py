@@ -21,6 +21,8 @@ import threading
 import shutil
 from pathlib import Path
 
+import cv2
+import cv2
 import numpy as np
 import rerun as rr
 from huggingface_hub import HfApi
@@ -35,6 +37,27 @@ from utils.rerun_utils import init_rerun
 from utils.robot_utils import create_follower, create_leader, safe_disconnect
 
 USE_RERUN = False  # Set True to enable Rerun visualizer (adds latency)
+SHOW_CAMERAS = True  # Live camera preview via OpenCV (minimal latency)
+
+
+def show_camera_preview(observation):
+    """Display camera feeds side-by-side in an OpenCV window."""
+    if not SHOW_CAMERAS:
+        return
+    panels = []
+    for cam_name in CAMERAS:
+        key = f"observation.images.{cam_name}"
+        if key in observation:
+            img = observation[key]
+            if isinstance(img, np.ndarray):
+                if img.ndim == 3 and img.shape[2] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                cv2.putText(img, cam_name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                panels.append(img)
+    if panels:
+        combined = np.hstack(panels) if len(panels) > 1 else panels[0]
+        cv2.imshow("Camera Preview", combined)
+        cv2.waitKey(1)
 
 # ──────────────────────────────────────────────
 # Replay from buffer helper
@@ -166,6 +189,8 @@ def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
                 print(f"\n  ⚠️  USB glitch (retrying): {e}")
                 time.sleep(0.05)
                 continue
+
+            show_camera_preview(observation)
 
             # Buffer for potential replay
             action_buffer.append([sent_action[k] for k in sorted(sent_action)])
@@ -326,6 +351,8 @@ def main():
                     loop_start = time.perf_counter()
                     action = leader.get_action()
                     follower.send_action(action)
+                    observation = follower.get_observation()
+                    show_camera_preview(observation)
 
                     if replay_ep.is_set():
                         replay_ep.clear()
@@ -364,6 +391,8 @@ def main():
                     print(f"  Next episode in {remaining:.0f}s...", end="\r")
                     action = leader.get_action()
                     follower.send_action(action)
+                    observation = follower.get_observation()
+                    show_camera_preview(observation)
                     maintain_fps(time.perf_counter(), FPS)
             except KeyboardInterrupt:
                 print("\n\n  Stopping recording.")
@@ -375,6 +404,8 @@ def main():
     finally:
         safe_disconnect(follower)
         safe_disconnect(leader)
+        if SHOW_CAMERAS:
+            cv2.destroyAllWindows()
 
     # Push to hub (optional)
     if PUSH_TO_HUB:
