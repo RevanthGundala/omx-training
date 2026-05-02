@@ -44,8 +44,22 @@ def drive_follower_to_leader(leader, follower, duration_s=3.0, fps=30):
     print("\nDriving follower to match leader pose...")
     current = follower.get_observation()
     target = leader.get_action()
-    steps = max(1, int(duration_s * fps))
 
+    print("\n  Joint position comparison (before driving):")
+    print(f"  {'Joint':<18} {'Leader':>10} {'Follower':>10} {'Delta':>10}")
+    print(f"  {'-'*18} {'-'*10} {'-'*10} {'-'*10}")
+    for key in sorted(target):
+        if key == "gripper.pos":
+            continue
+        l_val = target.get(key, 0)
+        f_val = current.get(key, 0)
+        delta = l_val - f_val
+        flag = " ⚠️ LARGE" if abs(delta) > 100 else ""
+        print(f"  {key:<18} {l_val:>10.1f} {f_val:>10.1f} {delta:>+10.1f}{flag}")
+
+    input("\n  Press ENTER to start driving follower (Ctrl+C to abort)...")
+
+    steps = max(1, int(duration_s * fps))
     for step in range(1, steps + 1):
         alpha = step / steps
         blended = {}
@@ -53,14 +67,25 @@ def drive_follower_to_leader(leader, follower, duration_s=3.0, fps=30):
             if key == "gripper.pos":
                 continue
             blended[key] = current.get(key, 0) + alpha * (target.get(key, 0) - current.get(key, 0))
-        # Keep gripper at current position
         if "gripper.pos" in target:
             blended["gripper.pos"] = current.get("gripper.pos", 0)
         follower.send_action(blended)
         time.sleep(1.0 / fps)
 
-    print("  Follower matched to leader pose.")
-    # Disable torque so set_half_turn_homings can run
+    final = follower.get_observation()
+    print("\n  Joint position comparison (after driving):")
+    print(f"  {'Joint':<18} {'Leader':>10} {'Follower':>10} {'Error':>10}")
+    print(f"  {'-'*18} {'-'*10} {'-'*10} {'-'*10}")
+    for key in sorted(target):
+        if key == "gripper.pos":
+            continue
+        l_val = target.get(key, 0)
+        f_val = final.get(key, 0)
+        err = l_val - f_val
+        flag = " ⚠️ INVERTED?" if abs(err) > 50 else ""
+        print(f"  {key:<18} {l_val:>10.1f} {f_val:>10.1f} {err:>+10.1f}{flag}")
+
+    print("\n  Follower matched to leader pose.")
     follower.bus.disable_torque()
 
 

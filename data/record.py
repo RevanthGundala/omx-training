@@ -472,6 +472,14 @@ def main():
         camera_preview.stop()
         safe_disconnect(follower)
         safe_disconnect(leader)
+        # CRITICAL: finalize the dataset writer so the parquet footer is written.
+        # Without this, the on-disk parquet has data but no footer and is unreadable
+        # ("Parquet magic bytes not found in footer" on resume/load).
+        try:
+            dataset.finalize()
+            print(f"Dataset finalized: {dataset.num_episodes} episodes committed.")
+        except Exception as e:
+            print(f"WARNING: dataset.finalize() failed: {e}")
 
     # Push to hub (optional)
     if PUSH_TO_HUB:

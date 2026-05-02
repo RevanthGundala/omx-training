@@ -192,11 +192,13 @@ def main() -> None:
                 json.dump(cal, f, indent=4)
             print(f"  saved {path}")
 
-        # ---------- Save inversion side file ----------
+        # Inversion side file: PatchedOmxLeader/PatchedOmxFollower load this
+        # at __init__ to decide whether to flip gripper.pos in software so the
+        # convention 0=CLOSED, 100=OPEN holds end-to-end on both arms.
         GRIPPER_INVERSION_PATH.parent.mkdir(parents=True, exist_ok=True)
         with GRIPPER_INVERSION_PATH.open("w") as f:
             json.dump({"leader": l_inverted, "follower": f_inverted}, f, indent=4)
-        print(f"  saved {GRIPPER_INVERSION_PATH}")
+        print(f"  saved {GRIPPER_INVERSION_PATH}  (leader={l_inverted}, follower={f_inverted})")
 
         # ---------- Verify on leader (after re-applying configure-style setup) ----------
         # With torque off, leader spring rests at OPEN. After Patched configure() runs

@@ -37,7 +37,9 @@ def assert_arms_aligned(leader, follower, threshold=ALIGNMENT_THRESHOLD):
     if bad:
         raise RuntimeError(
             "Arms not aligned at start pose — refusing to move follower.\n"
-            "Re-run `uv run python align_follower.py`.\n"
+            "Pose BOTH arms at the same physical pose, then either:\n"
+            "  - re-run `lerobot-calibrate --robot.type=omx_follower ...` and same for leader\n"
+            "  - or just power-cycle and reconnect with both arms in the same pose\n"
             "Offending joints:\n" + "\n".join(bad)
         )
 
