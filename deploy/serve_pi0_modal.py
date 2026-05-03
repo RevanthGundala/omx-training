@@ -12,8 +12,8 @@ import modal
 
 app = modal.App("omx-pi05-eval")
 
-DATASET_REPO_ID = "RevanthGundala/002-pour-water"
-CHECKPOINT_STEP = "010000"  # or "005000" for the earlier checkpoint
+DATASET_REPO_ID = "RevanthGundala/003-pour-water"
+CHECKPOINT_STEP = "003000"  # PI0.5 full finetune (3k steps, batch=32, ~163 epochs)
 
 hf_secret = modal.Secret.from_name("huggingface")
 vol = modal.Volume.from_name("omx-pi0-training-logs", create_if_missing=True)
@@ -52,7 +52,7 @@ class Pi0Server:
         os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
         vol.reload()
 
-        checkpoint_path = Path(f"/workspace/outputs/run/checkpoints/{CHECKPOINT_STEP}/pretrained_model")
+        checkpoint_path = Path(f"/workspace/outputs/checkpoints/{CHECKPOINT_STEP}/pretrained_model")
         if not checkpoint_path.exists():
             raise FileNotFoundError(
                 f"Checkpoint not found at {checkpoint_path}. "
@@ -81,7 +81,7 @@ class Pi0Server:
             cfg=PI05Config(
                 pretrained_path=str(checkpoint_path),
                 device="cuda",
-                chunk_size=100,
+                chunk_size=50,
                 n_action_steps=50,
                 rtc_config=RTCConfig(enabled=True, execution_horizon=40),
             ),
