@@ -30,6 +30,8 @@ from utils.robot_utils import create_follower, safe_disconnect
 # Eval-specific configuration
 # ──────────────────────────────────────────────
 START_DELAY_S = 3
+# PI05Config.chunk_size default in lerobot/policies/pi05/configuration_pi05.py.
+PI05_ACTION_CHUNK_SIZE = 50
 
 
 def _build_follower():
@@ -39,6 +41,10 @@ def _build_follower():
 # ──────────────────────────────────────────────
 # Thread-safe action queue for RTC
 # ──────────────────────────────────────────────
+# RTC inference_delay is a model-level parameter from PI's June 2025
+# Real-Time Chunking work (https://pi.website/research/real_time_chunking).
+# lerobot's rtc.denoise_step docstring defines it as the number of prefix
+# timesteps to guide: K freezes prev_chunk_left_over[:K] and inpaints the rest.
 class RTCActionQueue:
     """Thread-safe action queue that supports RTC-style replacement.
 
@@ -52,7 +58,8 @@ class RTCActionQueue:
     so the robot never stalls.
     """
 
-    def __init__(self):
+    def __init__(self, chunk_size: int = PI05_ACTION_CHUNK_SIZE):
+        self.chunk_size = chunk_size
         self._lock = threading.Lock()
         self._queue: deque[np.ndarray] = deque()
         self._last_action: np.ndarray | None = None
@@ -221,9 +228,7 @@ def main():
 
             # Use the previous round-trip's actual delay as the best estimate
             # of how many steps will be consumed during THIS round-trip.
-            # Also read current steps consumed for the prev_chunk slice.
-            steps_consumed_now = action_queue.steps_since_replace
-            estimated_delay = steps_consumed_now + last_round_trip_delay
+            estimated_delay = max(0, min(last_round_trip_delay, action_queue.chunk_size - 1))
 
             if first_call:
                 print("Sending first inference request to server...")
@@ -235,6 +240,7 @@ def main():
                 )
                 # Atomically read consumed steps and swap the queue
                 actual_skip = action_queue.replace_atomic(actions)
+                print(f"  [rtc] est_delay={estimated_delay} actual_skip={actual_skip} qsize_after={action_queue.qsize()}")
                 last_round_trip_delay = actual_skip
                 if first_call:
                     print(f"First inference returned {len(actions)} actions. Robot active!")

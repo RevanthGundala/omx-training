@@ -14,10 +14,14 @@ Usage:
        export HF_TOKEN="your-token"  (or run: huggingface-cli login)
        export OMX_GPU_NAME="A100_PCIE_80GB"  # optional
        export OMX_VAST_IMAGE="pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel"  # optional
-   2. Run: uv run python deploy/train_vastai.py
+   2. Run: uv run python deploy/train_vastai.py --profile pour_absolute
+      Or: uv run python deploy/train_vastai.py --profile pour_relative
 """
 
+import argparse
 import ast
+from dataclasses import asdict
+import importlib
 import json
 import os
 import sys
@@ -26,22 +30,30 @@ from pathlib import Path
 
 from vastai_sdk import VastAI
 
-from utils.config import TRAIN_DATASET_REPO_ID as DATASET_REPO_ID
 from utils.control_utils import get_hf_token
 
+parser = argparse.ArgumentParser(description="Launch PI0.5 finetuning on a Vast.ai GPU.")
+parser.add_argument(
+    "--profile",
+    default="pour_absolute",
+    help="Training config profile under configs.train (default: pour_absolute).",
+)
+args = parser.parse_args()
+module = importlib.import_module(f"configs.train.{args.profile}")
+config = module.config
+
 # ──────────────────────────────────────────────
-# Configuration — edit these
+# Configuration
 # ──────────────────────────────────────────────
 VASTAI_API_KEY = os.environ.get("VASTAI_API_KEY", "")
 HF_TOKEN = get_hf_token()
-DATASET_REVISION = "main"
-DEFAULT_GPU_NAME = "A100_PCIE"
-MIN_GPU_RAM_MB = 75000  # require 80GB-class GPU (filters out 40GB A100s)
-DEFAULT_VAST_IMAGE = "nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04"
-GPU_NAME = os.environ.get("OMX_GPU_NAME", DEFAULT_GPU_NAME)
-DISK_GB = 150
-INSTANCE_LABEL = "omx-pi05-training"
-VAST_IMAGE = os.environ.get("OMX_VAST_IMAGE", DEFAULT_VAST_IMAGE)
+DATASET_REPO_ID = config.dataset_repo_id
+DATASET_REVISION = config.dataset_revision
+GPU_NAME = os.environ.get("OMX_GPU_NAME", config.gpu_name)
+MIN_GPU_RAM_MB = config.min_gpu_ram_mb  # require 80GB-class GPU (filters out 40GB A100s)
+DISK_GB = config.disk_gb
+INSTANCE_LABEL = config.instance_label
+VAST_IMAGE = os.environ.get("OMX_VAST_IMAGE", config.vast_image)
 
 POLL_INTERVAL = 15  # seconds between status checks
 BOOT_TIMEOUT = 1200  # max seconds to wait for instance to start running
@@ -227,27 +239,26 @@ echo "=== Starting PI0.5 finetuning (stock lerobot-train CLI) ==="
 # Output is teed to /workspace/train.log so we can `vastai logs` or ssh tail it.
 lerobot-train \
     --dataset.repo_id={dataset_repo_id} \
-    --policy.type=pi05 \
-    --output_dir=/workspace/outputs \
-    --job_name=pi05_pour_water \
-    --policy.pretrained_path=lerobot/pi05_base \
-    --policy.repo_id=RevanthGundala/pi05-pour-water-3k \
-    --policy.compile_model=true \
-    --policy.gradient_checkpointing=true \
-    --policy.dtype=bfloat16 \
-    --policy.freeze_vision_encoder=false \
-    --policy.train_expert_only=false \
-    --steps=3000 \
-    --batch_size=32 \
+    --policy.type={policy_type} \
+    --output_dir={output_dir} \
+    --job_name={job_name} \
+    --policy.pretrained_path={policy_pretrained_path} \
+    --policy.repo_id={policy_repo_id} \
+    --policy.compile_model={compile_model} \
+    --policy.gradient_checkpointing={gradient_checkpointing} \
+    --policy.dtype={dtype} \
+    --policy.freeze_vision_encoder={freeze_vision_encoder} \
+    --policy.train_expert_only={train_expert_only} \
+    --steps={steps} \
+    --batch_size={batch_size} \
     --policy.device=cuda \
-    --log_freq=50 \
+    --log_freq={log_freq} \
     2>&1 | tee /workspace/train.log
 
 echo "=== TRAINING COMPLETE ==="
 '''.format(
+        **{k: (str(v).lower() if isinstance(v, bool) else v) for k, v in asdict(config).items()},
         hf_token=HF_TOKEN,
-        dataset_repo_id=DATASET_REPO_ID,
-        dataset_revision=DATASET_REVISION,
         dataset_root_name=f"{DATASET_REPO_ID.replace('/', '__')}__{DATASET_REVISION}",
     )
 

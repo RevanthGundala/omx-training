@@ -153,8 +153,7 @@ def main():
             with obs_lock:
                 obs_snapshot = {k: v for k, v in latest_observation.items()}
                 frame_snapshot = latest_observation_frame
-            steps_consumed_now = action_queue.steps_since_replace
-            estimated_delay = steps_consumed_now + last_round_trip_delay
+            estimated_delay = max(0, min(last_round_trip_delay, action_queue.chunk_size - 1))
             if first_call:
                 print("Sending first QUIC inference request ...")
             inference_running.set()
@@ -174,6 +173,7 @@ def main():
                       f"prev_chunk={dbg.get('prev_chunk_exists')}")
                 actions = np.array(data["actions"], dtype=np.float32)
                 actual_skip = action_queue.replace_atomic(actions)
+                print(f"  [rtc] est_delay={estimated_delay} actual_skip={actual_skip} qsize_after={action_queue.qsize()}")
                 last_round_trip_delay = actual_skip
                 if first_call:
                     print(f"First inference returned {len(actions)} actions. Robot active!")
