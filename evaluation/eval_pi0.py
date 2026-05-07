@@ -32,6 +32,11 @@ from utils.robot_utils import create_follower, safe_disconnect
 START_DELAY_S = 3
 # PI05Config.chunk_size default in lerobot/policies/pi05/configuration_pi05.py.
 PI05_ACTION_CHUNK_SIZE = 50
+# Match LeRobot's RTCInferenceEngine default refill threshold.  We request the
+# next chunk only after enough of the current chunk has been consumed, so RTC's
+# prev_chunk_left_over is the true unexecuted tail instead of the whole chunk.
+RTC_QUEUE_REFILL_THRESHOLD = 30
+RTC_IDLE_SLEEP_S = 0.01
 
 
 def _build_follower():
@@ -63,6 +68,7 @@ class RTCActionQueue:
         self._lock = threading.Lock()
         self._queue: deque[np.ndarray] = deque()
         self._last_action: np.ndarray | None = None
+        self._queue_start_index = 0
         self._steps_since_replace = 0
 
     def replace(self, actions: np.ndarray, skip: int = 0):
@@ -72,6 +78,7 @@ class RTCActionQueue:
             clamped_skip = max(0, min(skip, len(actions)))
             for row in actions[clamped_skip:]:
                 self._queue.append(row)
+            self._queue_start_index = clamped_skip
             self._steps_since_replace = 0
 
     def replace_atomic(self, actions: np.ndarray) -> int:
@@ -87,6 +94,20 @@ class RTCActionQueue:
             self._queue.clear()
             for row in actions[skip:]:
                 self._queue.append(row)
+            self._queue_start_index = skip
+            self._steps_since_replace = 0
+            return skip
+
+    def replace_after_request(self, actions: np.ndarray, request_chunk_index: int) -> int:
+        """Replace the queue, skipping rows consumed while inference was running."""
+        with self._lock:
+            current_chunk_index = self._queue_start_index + self._steps_since_replace
+            real_delay = max(0, current_chunk_index - request_chunk_index)
+            skip = max(0, min(real_delay, len(actions)))
+            self._queue.clear()
+            for row in actions[skip:]:
+                self._queue.append(row)
+            self._queue_start_index = skip
             self._steps_since_replace = 0
             return skip
 
@@ -105,6 +126,11 @@ class RTCActionQueue:
         with self._lock:
             return len(self._queue)
 
+    def request_snapshot(self) -> tuple[int, int]:
+        """Return (remaining queue size, next absolute chunk index) atomically."""
+        with self._lock:
+            return len(self._queue), self._queue_start_index + self._steps_since_replace
+
     @property
     def steps_since_replace(self) -> int:
         with self._lock:
@@ -119,14 +145,24 @@ class RTCActionQueue:
 # ──────────────────────────────────────────────
 # Remote inference (Modal)
 # ──────────────────────────────────────────────
-def _predict_remote(observation_frame, server_url, observation, steps_executed: int):
+def _predict_remote(
+    observation_frame,
+    server_url,
+    observation,
+    inference_delay: int,
+    prev_steps_consumed: int,
+):
     import cv2
     state = np.asarray(observation_frame["observation.state"]).tolist()
     payload = {
         "state": state,
         "task": TASK_NAME,
         "robot_type": "omx_follower",
-        "steps_executed": steps_executed,
+        # Keep steps_executed for older servers; newer servers distinguish
+        # chunk alignment from future execution delay.
+        "steps_executed": inference_delay,
+        "inference_delay": inference_delay,
+        "prev_steps_consumed": prev_steps_consumed,
     }
 
     for cam_name in CAMERAS:
@@ -142,6 +178,7 @@ def _predict_remote(observation_frame, server_url, observation, steps_executed: 
     if "debug" in data:
         dbg = data["debug"]
         print(f"\n  [server] inference_delay={dbg.get('inference_delay')}, "
+              f"prev_steps_consumed={dbg.get('prev_steps_consumed')}, "
               f"prev_chunk={dbg.get('prev_chunk_exists')}, "
               f"leftover_shape={dbg.get('prev_left_over_shape')}")
     return np.array(data["actions"], dtype=np.float32)
@@ -221,6 +258,11 @@ def main():
         first_call = True
         last_round_trip_delay = 0  # estimate for next inference_delay
         while not stop_event.is_set():
+            queue_size, request_steps_consumed = action_queue.request_snapshot()
+            if not first_call and queue_size > RTC_QUEUE_REFILL_THRESHOLD:
+                time.sleep(RTC_IDLE_SLEEP_S)
+                continue
+
             # Snapshot the freshest observation and steps consumed
             with obs_lock:
                 obs_snapshot = {k: v for k, v in latest_observation.items()}
@@ -229,6 +271,9 @@ def main():
             # Use the previous round-trip's actual delay as the best estimate
             # of how many steps will be consumed during THIS round-trip.
             estimated_delay = max(0, min(last_round_trip_delay, action_queue.chunk_size - 1))
+            prev_steps_consumed = max(
+                0, min(request_steps_consumed, action_queue.chunk_size - 1)
+            )
 
             if first_call:
                 print("Sending first inference request to server...")
@@ -236,11 +281,18 @@ def main():
             inference_running.set()
             try:
                 actions = _predict_remote(
-                    frame_snapshot, server_url, obs_snapshot, estimated_delay,
+                    frame_snapshot,
+                    server_url,
+                    obs_snapshot,
+                    estimated_delay,
+                    prev_steps_consumed,
                 )
-                # Atomically read consumed steps and swap the queue
-                actual_skip = action_queue.replace_atomic(actions)
-                print(f"  [rtc] est_delay={estimated_delay} actual_skip={actual_skip} qsize_after={action_queue.qsize()}")
+                actual_skip = action_queue.replace_after_request(actions, request_steps_consumed)
+                print(
+                    f"  [rtc] prev_steps={prev_steps_consumed} "
+                    f"est_delay={estimated_delay} actual_skip={actual_skip} "
+                    f"qsize_after={action_queue.qsize()}"
+                )
                 last_round_trip_delay = actual_skip
                 if first_call:
                     print(f"First inference returned {len(actions)} actions. Robot active!")
@@ -299,6 +351,7 @@ def main():
 
             sent_action = follower.send_action(action)
 
+            maintain_fps(loop_start, FPS)
             loop_dt = time.perf_counter() - loop_start
             hz = 1.0 / loop_dt if loop_dt > 0 else float("inf")
 
@@ -337,8 +390,6 @@ def main():
                 f"{name}: {value:7.2f}" for name, value in sent_action.items()
             )
             print(f"Step {step:05d} | {hz:5.1f} Hz | Q:{queue_len:2d} {inf_sym}| {action_preview}", end="\r")
-
-            maintain_fps(loop_start, FPS)
 
     except KeyboardInterrupt:
         print("\n\nStopping Pi0 eval...")

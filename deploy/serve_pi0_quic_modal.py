@@ -65,7 +65,12 @@ pi05_image = (
     volumes={"/workspace/outputs": vol},
     secrets=[hf_secret],
 )
-def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict:
+def serve(
+    session_id: str,
+    stun_server: str = "stun.l.google.com:19302",
+    checkpoint_repo_id: str | None = None,
+    dataset_repo_id: str | None = None,
+) -> dict:
     """One-shot server: rendezvous with client, accept QUIC, run inference loop."""
     import os
     import time
@@ -76,6 +81,7 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
     import torch
     from copy import copy
     from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
 
     import omx_quic
     from omx_quic import rendezvous
@@ -83,15 +89,25 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
     os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
     vol.reload()
 
-    checkpoint_path = Path(
-        f"/workspace/outputs/checkpoints/{CHECKPOINT_STEP}/pretrained_model"
+    effective_dataset_repo_id = dataset_repo_id or DATASET_REPO_ID
+    if checkpoint_repo_id is not None:
+        checkpoint_path = Path(snapshot_download(repo_id=checkpoint_repo_id))
+        checkpoint_source = f"hf:{checkpoint_repo_id}"
+    else:
+        checkpoint_path = Path(
+            f"/workspace/outputs/checkpoints/{CHECKPOINT_STEP}/pretrained_model"
+        )
+        checkpoint_source = f"volume:{checkpoint_path}"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+    pretrained_path = str(checkpoint_path)
+    pre_post_pretrained_path = (
+        pretrained_path if checkpoint_repo_id is not None else "lerobot/pi05_base"
     )
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
     dataset_root = Path("/tmp/dataset")
     snapshot_download(
-        repo_id=DATASET_REPO_ID,
+        repo_id=effective_dataset_repo_id,
         repo_type="dataset",
         local_dir=dataset_root,
     )
@@ -102,12 +118,36 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
     from lerobot.policies.factory import make_policy, make_pre_post_processors
     from lerobot.policies.utils import prepare_observation_for_inference
 
+    def load_checkpoint_processor_stats(path: Path) -> dict | None:
+        stats_file = path / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+        if not stats_file.exists():
+            stats_file = path / "policy_preprocessor_step_2_normalizer_processor.safetensors"
+        if not stats_file.exists():
+            return None
+        flat_stats = load_file(str(stats_file))
+        nested: dict[str, dict] = {}
+        for key, value in flat_stats.items():
+            if "." not in key:
+                continue
+            feature, stat_name = key.rsplit(".", 1)
+            nested.setdefault(feature, {})[stat_name] = value
+        return nested
+
+    print(
+        "[server] config "
+        f"checkpoint={checkpoint_source} resolved_path={checkpoint_path} "
+        f"dataset={effective_dataset_repo_id} "
+        f"pre_post={pre_post_pretrained_path}"
+    )
     print(f"[server] loading PI0.5 from {checkpoint_path} ...")
-    ds_meta = LeRobotDatasetMetadata(DATASET_REPO_ID, root=dataset_root)
+    ds_meta = LeRobotDatasetMetadata(effective_dataset_repo_id, root=dataset_root)
+    checkpoint_stats = load_checkpoint_processor_stats(checkpoint_path)
+    eval_stats = checkpoint_stats or ds_meta.stats
+    stats_source = "checkpoint_processor" if checkpoint_stats is not None else "dataset_metadata"
     device = torch.device("cuda")
     policy = make_policy(
         cfg=PI05Config(
-            pretrained_path=str(checkpoint_path),
+            pretrained_path=pretrained_path,
             device="cuda",
             chunk_size=50,
             n_action_steps=50,
@@ -120,12 +160,12 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
 
     preprocessor, _ = make_pre_post_processors(
         policy_cfg=policy.config,
-        pretrained_path="lerobot/pi05_base",
-        dataset_stats=ds_meta.stats,
+        pretrained_path=pre_post_pretrained_path,
+        dataset_stats=eval_stats,
         preprocessor_overrides={
             "device_processor": {"device": "cuda"},
             "normalizer_processor": {
-                "stats": ds_meta.stats,
+                "stats": eval_stats,
                 "features": {
                     **policy.config.input_features,
                     **policy.config.output_features,
@@ -135,7 +175,7 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
         },
         postprocessor_overrides={
             "unnormalizer_processor": {
-                "stats": ds_meta.stats,
+                "stats": eval_stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -143,15 +183,89 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
     )
 
     action_q01 = torch.as_tensor(
-        ds_meta.stats["action"]["q01"], dtype=torch.float32
+        eval_stats["action"]["q01"], dtype=torch.float32
     ).to(device)
     action_q99 = torch.as_tensor(
-        ds_meta.stats["action"]["q99"], dtype=torch.float32
+        eval_stats["action"]["q99"], dtype=torch.float32
     ).to(device)
+
+    # UMI-style relative actions: after unnormalize, the non-excluded action dims
+    # are deltas relative to the obs-capture state. We add the raw state back to
+    # recover absolute targets for the client. Excluded dims (typically gripper)
+    # were trained absolutely and don't need state added.
+    use_relative_actions = bool(getattr(policy.config, "use_relative_actions", False))
+    relative_exclude_joints = list(getattr(policy.config, "relative_exclude_joints", []) or [])
+    action_feature_names = list(getattr(policy.config, "action_feature_names", []) or [])
+    if use_relative_actions and action_feature_names:
+        exclude_lower = {str(j).lower() for j in relative_exclude_joints}
+        relative_dim_mask = torch.tensor(
+            [
+                0.0 if any(t == str(name).lower() or t in str(name).lower() for t in exclude_lower)
+                else 1.0
+                for name in action_feature_names
+            ],
+            dtype=torch.float32,
+        ).to(device)
+    else:
+        relative_dim_mask = None
+    print(
+        f"[server] use_relative_actions={use_relative_actions} "
+        f"exclude_joints={relative_exclude_joints} "
+        f"action_feature_names={action_feature_names}"
+    )
+
+    action_q50 = list(torch.as_tensor(eval_stats["action"].get("q50", [])).cpu().flatten().tolist())
+    state_q50 = list(torch.as_tensor(eval_stats["observation.state"].get("q50", [])).cpu().flatten().tolist())
+    dataset_action_q50 = list(torch.as_tensor(ds_meta.stats["action"].get("q50", [])).cpu().flatten().tolist())
+    non_gripper_action_q50 = [
+        float(v)
+        for name, v in zip(action_feature_names, action_q50, strict=False)
+        if "gripper" not in str(name).lower()
+    ]
+    non_gripper_state_q50 = [
+        float(v)
+        for name, v in zip(action_feature_names, state_q50, strict=False)
+        if "gripper" not in str(name).lower()
+    ]
+    stats_warning = None
+    if (
+        stats_source == "dataset_metadata"
+        and not use_relative_actions
+        and non_gripper_action_q50
+        and non_gripper_state_q50
+        and sum(abs(v) < 5.0 for v in non_gripper_action_q50) >= 3
+        and sum(abs(v) > 10.0 for v in non_gripper_state_q50) >= 3
+    ):
+        stats_warning = (
+            "Policy config is absolute (use_relative_actions=False), but dataset "
+            "action q50 values look relative/near-zero for most arm joints. "
+            "Recompute absolute action stats before live eval."
+        )
+        print(f"[server] WARNING: {stats_warning}", flush=True)
+    print(
+        f"[server] stats_source={stats_source} action_q50={action_q50} "
+        f"dataset_action_q50={dataset_action_q50}",
+        flush=True,
+    )
 
     state = {
         "prev_chunk": None,
         "steps_since_predict": 0,
+    }
+
+    server_info = {
+        "checkpoint_source": checkpoint_source,
+        "checkpoint_path": pretrained_path,
+        "dataset_repo_id": effective_dataset_repo_id,
+        "pre_post_pretrained_path": pre_post_pretrained_path,
+        "stats_source": stats_source,
+        "use_relative_actions": use_relative_actions,
+        "relative_exclude_joints": relative_exclude_joints,
+        "action_feature_names": action_feature_names,
+        "action_q50": action_q50,
+        "dataset_action_q50": dataset_action_q50,
+        "state_q50": state_q50,
+        "stats_warning": stats_warning,
     }
 
     def decode_image(b64_str: str, shape=None):
@@ -164,7 +278,8 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
 
     def handle_predict(payload: dict) -> dict:
         observation = {}
-        observation["observation.state"] = np.array(payload["state"], dtype=np.float32)
+        raw_state = np.array(payload["state"], dtype=np.float32)
+        observation["observation.state"] = raw_state
         for cam_name in ("wrist", "top"):
             img_key = f"image_{cam_name}"
             if img_key in payload:
@@ -172,7 +287,11 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
                     payload[img_key], payload.get(f"image_{cam_name}_shape")
                 )
 
-        steps_executed = payload.get("steps_executed", state["steps_since_predict"])
+        inference_delay = int(payload.get(
+            "inference_delay",
+            payload.get("steps_executed", state["steps_since_predict"]),
+        ))
+        prev_steps_consumed = int(payload.get("prev_steps_consumed", inference_delay))
 
         observation = copy(observation)
         observation = prepare_observation_for_inference(
@@ -184,12 +303,12 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
 
         prev_left_over = None
         if state["prev_chunk"] is not None:
-            prev_left_over = state["prev_chunk"][:, steps_executed:, :]
+            prev_left_over = state["prev_chunk"][:, prev_steps_consumed:, :]
 
         actions = policy.predict_action_chunk(
             observation,
             prev_chunk_left_over=prev_left_over,
-            inference_delay=steps_executed,
+            inference_delay=inference_delay,
         )
         state["prev_chunk"] = actions.clone().detach()
         state["steps_since_predict"] = 0
@@ -198,14 +317,25 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
         denom = torch.where(denom == 0, torch.tensor(1e-8, device=denom.device), denom)
         actions_to_send = (actions + 1.0) * denom / 2.0 + action_q01
 
+        # UMI-style: add raw obs-capture state back for the dims that were trained
+        # as deltas. Apply once per chunk (broadcast over the chunk timesteps).
+        if use_relative_actions and relative_dim_mask is not None:
+            state_t = torch.as_tensor(raw_state, dtype=actions_to_send.dtype, device=device)
+            dims = relative_dim_mask.shape[0]
+            offset = (state_t[:dims] * relative_dim_mask).reshape(1, 1, dims)
+            actions_to_send = actions_to_send.clone()
+            actions_to_send[..., :dims] += offset
+
         return {
             "actions": actions_to_send.squeeze(0).cpu().numpy().tolist(),
             "debug": {
-                "inference_delay": steps_executed,
+                "inference_delay": inference_delay,
+                "prev_steps_consumed": prev_steps_consumed,
                 "prev_chunk_exists": state["prev_chunk"] is not None,
                 "prev_left_over_shape": list(prev_left_over.shape)
                 if prev_left_over is not None
                 else None,
+                "use_relative_actions": use_relative_actions,
             },
         }
 
@@ -224,7 +354,7 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
                 state["steps_since_predict"] = 0
                 resp = {"status": "ok"}
             elif op == "health":
-                resp = {"status": "ready"}
+                resp = {"status": "ready", **server_info}
             else:
                 resp = {"error": f"unknown op {op!r}"}
         except Exception as e:
@@ -307,8 +437,13 @@ def serve(session_id: str, stun_server: str = "stun.l.google.com:19302") -> dict
 
 
 @app.local_entrypoint()
-def main(session_id: str = "omx-default", stun_server: str = "stun.l.google.com:19302"):
+def main(
+    session_id: str = "omx-default",
+    stun_server: str = "stun.l.google.com:19302",
+    checkpoint_repo_id: str | None = None,
+    dataset_repo_id: str | None = None,
+):
     print(f"Launching Modal QUIC server (session_id={session_id!r}). "
           "Run eval_pi0_quic.py with the same --session-id.")
-    result = serve.remote(session_id, stun_server)
+    result = serve.remote(session_id, stun_server, checkpoint_repo_id, dataset_repo_id)
     print(f"\nDone: {result}")

@@ -26,6 +26,7 @@ import omx_quic
 from omx_quic import rendezvous
 
 from evaluation.eval_pi0 import RTCActionQueue
+from evaluation.eval_pi0 import RTC_IDLE_SLEEP_S, RTC_QUEUE_REFILL_THRESHOLD
 
 START_DELAY_S = 3
 
@@ -34,7 +35,12 @@ def _build_follower():
     return create_follower(camera=True)
 
 
-def _build_payload(observation_frame, observation, steps_executed: int) -> bytes:
+def _build_payload(
+    observation_frame,
+    observation,
+    inference_delay: int,
+    prev_steps_consumed: int,
+) -> bytes:
     import cv2
     state = np.asarray(observation_frame["observation.state"]).tolist()
     payload = {
@@ -42,7 +48,11 @@ def _build_payload(observation_frame, observation, steps_executed: int) -> bytes
         "state": state,
         "task": TASK_NAME,
         "robot_type": "omx_follower",
-        "steps_executed": steps_executed,
+        # Keep steps_executed for older servers; newer servers distinguish
+        # chunk alignment from future execution delay.
+        "steps_executed": inference_delay,
+        "inference_delay": inference_delay,
+        "prev_steps_consumed": prev_steps_consumed,
     }
     for cam_name in CAMERAS:
         if cam_name in observation:
@@ -66,18 +76,26 @@ def _connect_quic(session_id: str, stun_server: str) -> omx_quic.QuicClient:
             "this network. Try a different network or a TURN relay."
         )
     rendezvous.publish(session_id, "client", pub_ip, pub_port)
-    print(f"[client] waiting for server peer in rendezvous dict ...")
-    peer_ip, peer_port = rendezvous.wait_for_peer(session_id, "client", timeout_s=300.0)
-    print(f"[client] peer: {peer_ip}:{peer_port}")
-    client.set_peer_address(peer_ip, peer_port)
-    sent, received, elapsed = client.punch(timeout_s=15.0)
-    print(f"[client] punch ok: sent={sent} received={received} elapsed={elapsed:.3f}s")
-    print(f"[client] QUIC handshake ...")
-    t0 = time.perf_counter()
-    client.connect(timeout_s=30.0)
-    print(f"[client] QUIC connected in {(time.perf_counter()-t0)*1000:.1f}ms")
-    rendezvous.clear(session_id, "client")
-    return client
+    try:
+        print(f"[client] waiting for server peer in rendezvous dict ...")
+        peer_ip, peer_port = rendezvous.wait_for_peer(session_id, "client", timeout_s=300.0)
+        print(f"[client] peer: {peer_ip}:{peer_port}")
+        client.set_peer_address(peer_ip, peer_port)
+        sent, received, elapsed = client.punch(timeout_s=15.0)
+        print(f"[client] punch ok: sent={sent} received={received} elapsed={elapsed:.3f}s")
+        print(f"[client] QUIC handshake ...")
+        t0 = time.perf_counter()
+        client.connect(timeout_s=30.0)
+        print(f"[client] QUIC connected in {(time.perf_counter()-t0)*1000:.1f}ms")
+        return client
+    except Exception:
+        try:
+            client.close()
+        except Exception:
+            pass
+        raise
+    finally:
+        rendezvous.clear(session_id, "client")
 
 
 def main():
@@ -150,15 +168,28 @@ def main():
         first_call = True
         last_round_trip_delay = 0
         while not stop_event.is_set():
+            queue_size, request_steps_consumed = action_queue.request_snapshot()
+            if not first_call and queue_size > RTC_QUEUE_REFILL_THRESHOLD:
+                time.sleep(RTC_IDLE_SLEEP_S)
+                continue
+
             with obs_lock:
                 obs_snapshot = {k: v for k, v in latest_observation.items()}
                 frame_snapshot = latest_observation_frame
             estimated_delay = max(0, min(last_round_trip_delay, action_queue.chunk_size - 1))
+            prev_steps_consumed = max(
+                0, min(request_steps_consumed, action_queue.chunk_size - 1)
+            )
             if first_call:
                 print("Sending first QUIC inference request ...")
             inference_running.set()
             try:
-                req = _build_payload(frame_snapshot, obs_snapshot, estimated_delay)
+                req = _build_payload(
+                    frame_snapshot,
+                    obs_snapshot,
+                    estimated_delay,
+                    prev_steps_consumed,
+                )
                 t0 = time.perf_counter()
                 resp_bytes = quic_client.request(req, 30.0)
                 rtt_ms = (time.perf_counter() - t0) * 1000
@@ -169,11 +200,16 @@ def main():
                 dbg = data.get("debug", {})
                 print(f"\n  [client] RTT={rtt_ms:6.1f}ms "
                       f"req={len(req)/1024:.1f}KB resp={len(resp_bytes)/1024:.1f}KB "
-                      f"server_exec={dbg.get('inference_delay')}step_delay "
+                      f"server_delay={dbg.get('inference_delay')} "
+                      f"server_prev_steps={dbg.get('prev_steps_consumed')} "
                       f"prev_chunk={dbg.get('prev_chunk_exists')}")
                 actions = np.array(data["actions"], dtype=np.float32)
-                actual_skip = action_queue.replace_atomic(actions)
-                print(f"  [rtc] est_delay={estimated_delay} actual_skip={actual_skip} qsize_after={action_queue.qsize()}")
+                actual_skip = action_queue.replace_after_request(actions, request_steps_consumed)
+                print(
+                    f"  [rtc] prev_steps={prev_steps_consumed} "
+                    f"est_delay={estimated_delay} actual_skip={actual_skip} "
+                    f"qsize_after={action_queue.qsize()}"
+                )
                 last_round_trip_delay = actual_skip
                 if first_call:
                     print(f"First inference returned {len(actions)} actions. Robot active!")
@@ -226,6 +262,7 @@ def main():
 
             sent_action = follower.send_action(action)
 
+            maintain_fps(loop_start, FPS)
             loop_dt = time.perf_counter() - loop_start
             hz = 1.0 / loop_dt if loop_dt > 0 else float("inf")
 
@@ -257,7 +294,6 @@ def main():
                 f"{name}: {value:7.2f}" for name, value in sent_action.items()
             )
             print(f"Step {step:05d} | {hz:5.1f} Hz | Q:{queue_len:2d} {inf_sym}| {action_preview}", end="\r")
-            maintain_fps(loop_start, FPS)
 
     except KeyboardInterrupt:
         print("\n\nStopping Pi0 QUIC eval...")

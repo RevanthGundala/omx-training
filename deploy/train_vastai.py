@@ -249,6 +249,8 @@ lerobot-train \
     --policy.dtype={dtype} \
     --policy.freeze_vision_encoder={freeze_vision_encoder} \
     --policy.train_expert_only={train_expert_only} \
+    --policy.use_relative_actions={use_relative_actions} \
+    --policy.relative_exclude_joints="{relative_exclude_joints_cli}" \
     --steps={steps} \
     --batch_size={batch_size} \
     --policy.device=cuda \
@@ -260,6 +262,7 @@ echo "=== TRAINING COMPLETE ==="
         **{k: (str(v).lower() if isinstance(v, bool) else v) for k, v in asdict(config).items()},
         hf_token=HF_TOKEN,
         dataset_root_name=f"{DATASET_REPO_ID.replace('/', '__')}__{DATASET_REVISION}",
+        relative_exclude_joints_cli="[" + ",".join(repr(j) for j in config.relative_exclude_joints) + "]",
     )
 
 

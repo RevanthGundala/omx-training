@@ -48,6 +48,7 @@ class Pi0Server:
         import torch
         from pathlib import Path
         from huggingface_hub import snapshot_download
+        from safetensors.torch import load_file
 
         os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
         vol.reload()
@@ -73,6 +74,28 @@ class Pi0Server:
         from lerobot.policies.factory import make_policy, make_pre_post_processors
 
         ds_meta = LeRobotDatasetMetadata(DATASET_REPO_ID, root=dataset_root)
+        def load_checkpoint_processor_stats(path: Path) -> dict | None:
+            stats_file = path / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+            if not stats_file.exists():
+                stats_file = path / "policy_preprocessor_step_2_normalizer_processor.safetensors"
+            if not stats_file.exists():
+                return None
+            flat_stats = load_file(str(stats_file))
+            nested: dict[str, dict] = {}
+            for key, value in flat_stats.items():
+                if "." not in key:
+                    continue
+                feature, stat_name = key.rsplit(".", 1)
+                nested.setdefault(feature, {})[stat_name] = value
+            return nested
+
+        self.eval_stats = load_checkpoint_processor_stats(checkpoint_path) or ds_meta.stats
+        self.stats_source = (
+            "checkpoint_processor"
+            if (checkpoint_path / "policy_postprocessor_step_0_unnormalizer_processor.safetensors").exists()
+            else "dataset_metadata"
+        )
+        print(f"Using normalization stats from {self.stats_source}.")
 
         print(f"Loading PI0.5 checkpoint from {checkpoint_path}...")
         self.device = torch.device("cuda")
@@ -93,11 +116,11 @@ class Pi0Server:
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             policy_cfg=self.policy.config,
             pretrained_path="lerobot/pi05_base",
-            dataset_stats=ds_meta.stats,
+            dataset_stats=self.eval_stats,
             preprocessor_overrides={
                 "device_processor": {"device": "cuda"},
                 "normalizer_processor": {
-                    "stats": ds_meta.stats,
+                    "stats": self.eval_stats,
                     "features": {
                         **self.policy.config.input_features,
                         **self.policy.config.output_features,
@@ -107,7 +130,7 @@ class Pi0Server:
             },
             postprocessor_overrides={
                 "unnormalizer_processor": {
-                    "stats": ds_meta.stats,
+                    "stats": self.eval_stats,
                     "features": self.policy.config.output_features,
                     "norm_map": self.policy.config.normalization_mapping,
                 },
@@ -115,7 +138,7 @@ class Pi0Server:
         )
 
         # Cache action quantile stats on GPU for fast unnormalization
-        action_stats = ds_meta.stats["action"]
+        action_stats = self.eval_stats["action"]
         self.action_q01 = torch.as_tensor(action_stats["q01"], dtype=torch.float32).to(self.device)
         self.action_q99 = torch.as_tensor(action_stats["q99"], dtype=torch.float32).to(self.device)
 
@@ -156,10 +179,14 @@ class Pi0Server:
                 img = decode_image(payload[img_key], shape)
                 observation[f"observation.images.{cam_name}"] = img
 
-        # Use client-reported steps_executed as inference_delay (how many
-        # actions the client consumed since the last prediction). Falls back
-        # to the stored counter for backward compatibility.
-        steps_executed = payload.get("steps_executed", self.steps_since_predict)
+        # RTC needs two different clocks:
+        # - prev_steps_consumed: previous chunk index at observation/request time
+        # - inference_delay: estimated actions consumed while inference is in flight
+        inference_delay = int(payload.get(
+            "inference_delay",
+            payload.get("steps_executed", self.steps_since_predict),
+        ))
+        prev_steps_consumed = int(payload.get("prev_steps_consumed", inference_delay))
 
         # Preprocess once, run model once, unnormalize the full chunk
         observation = copy(observation)
@@ -174,14 +201,14 @@ class Pi0Server:
         # temporally with new_chunk[0] (the action about to be executed now).
         prev_left_over = None
         if self.prev_chunk is not None:
-            prev_left_over = self.prev_chunk[:, steps_executed:, :]
+            prev_left_over = self.prev_chunk[:, prev_steps_consumed:, :]
 
         # Single forward pass with RTC context
         # (predict_action_chunk has @torch.no_grad; RTC internally uses enable_grad)
         actions = self.policy.predict_action_chunk(
             observation,
             prev_chunk_left_over=prev_left_over,
-            inference_delay=steps_executed,
+            inference_delay=inference_delay,
         )
         # actions shape: (1, chunk_size, action_dim) — normalized
 
@@ -200,7 +227,8 @@ class Pi0Server:
         return {
             "actions": actions_to_send.squeeze(0).cpu().numpy().tolist(),
             "debug": {
-                "inference_delay": steps_executed,
+                "inference_delay": inference_delay,
+                "prev_steps_consumed": prev_steps_consumed,
                 "prev_chunk_exists": self.prev_chunk is not None,
                 "prev_left_over_shape": list(prev_left_over.shape) if prev_left_over is not None else None,
             },

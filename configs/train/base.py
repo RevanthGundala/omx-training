@@ -21,6 +21,10 @@ class TrainConfig:
     gradient_checkpointing: bool = True
     compile_model: bool = True
     log_freq: int = 50
+    # UMI-style relative actions (action -= state[obs] at training, += at inference).
+    # Gripper is excluded by default since open/close is more naturally absolute.
+    use_relative_actions: bool = False
+    relative_exclude_joints: tuple[str, ...] = ("gripper",)
     # Vast.ai instance
     gpu_name: str = "A100_PCIE"
     min_gpu_ram_mb: int = 75000
