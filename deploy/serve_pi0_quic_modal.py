@@ -70,6 +70,7 @@ def serve(
     stun_server: str = "stun.l.google.com:19302",
     checkpoint_repo_id: str | None = None,
     dataset_repo_id: str | None = None,
+    allow_stats_mismatch: bool = False,
 ) -> dict:
     """One-shot server: rendezvous with client, accept QUIC, run inference loop."""
     import os
@@ -78,6 +79,7 @@ def serve(
 
     import cv2
     import numpy as np
+    import pandas as pd
     import torch
     from copy import copy
     from huggingface_hub import snapshot_download
@@ -132,6 +134,75 @@ def serve(
             feature, stat_name = key.rsplit(".", 1)
             nested.setdefault(feature, {})[stat_name] = value
         return nested
+
+    def compute_global_action_quantiles(dataset_root: Path) -> dict[str, np.ndarray]:
+        actions = []
+        for path in sorted((dataset_root / "data").glob("chunk-*/file-*.parquet")):
+            df = pd.read_parquet(path, columns=["action"])
+            if len(df) > 0:
+                actions.append(np.stack(df["action"].to_numpy()).astype(np.float32))
+        if not actions:
+            raise RuntimeError(f"No action rows found under {dataset_root / 'data'}")
+        values = np.concatenate(actions, axis=0)
+        return {
+            "count": np.array([values.shape[0]], dtype=np.int64),
+            "q01": np.quantile(values, 0.01, axis=0),
+            "q99": np.quantile(values, 0.99, axis=0),
+        }
+
+    def check_action_stats_match_dataset(
+        eval_stats: dict,
+        dataset_root: Path,
+        *,
+        threshold: float = 0.25,
+    ) -> dict:
+        global_stats = compute_global_action_quantiles(dataset_root)
+        names = list(getattr(policy.config, "action_feature_names", []) or [])
+        if not names:
+            names = [f"dim_{i}" for i in range(len(global_stats["q01"]))]
+
+        rows = []
+        max_rel = 0.0
+        for stat_name in ("q01", "q99"):
+            checkpoint_values = np.asarray(eval_stats["action"][stat_name], dtype=np.float32).reshape(-1)
+            global_values = np.asarray(global_stats[stat_name], dtype=np.float32).reshape(-1)
+            denom = np.maximum(np.abs(global_values), 1.0)
+            rel = np.abs(checkpoint_values - global_values) / denom
+            max_rel = max(max_rel, float(rel.max()))
+            for name, ckpt, raw, rel_delta in zip(names, checkpoint_values, global_values, rel, strict=False):
+                rows.append(
+                    {
+                        "stat": stat_name,
+                        "joint": name,
+                        "checkpoint": float(ckpt),
+                        "dataset_global": float(raw),
+                        "rel_delta": float(rel_delta),
+                    }
+                )
+
+        ok = max_rel <= threshold
+        print(
+            f"[server] action_stats_global_check ok={ok} "
+            f"max_rel_delta={max_rel:.3f} threshold={threshold:.3f}",
+            flush=True,
+        )
+        for row in rows:
+            marker = " **MISMATCH**" if row["rel_delta"] > threshold else ""
+            print(
+                "[server]   "
+                f"{row['stat']} {row['joint']}: "
+                f"checkpoint={row['checkpoint']:.3f} "
+                f"dataset_global={row['dataset_global']:.3f} "
+                f"rel_delta={row['rel_delta']:.3f}{marker}",
+                flush=True,
+            )
+        return {
+            "ok": ok,
+            "max_rel_delta": max_rel,
+            "threshold": threshold,
+            "rows": rows,
+            "dataset_action_count": int(global_stats["count"][0]),
+        }
 
     print(
         "[server] config "
@@ -214,6 +285,14 @@ def serve(
         f"action_feature_names={action_feature_names}"
     )
 
+    stats_global_check = check_action_stats_match_dataset(eval_stats, dataset_root)
+    if not stats_global_check["ok"] and not allow_stats_mismatch:
+        raise RuntimeError(
+            "Checkpoint action q01/q99 do not match true global dataset action "
+            "q01/q99. Refusing live eval. Use a repaired global-stats dataset/checkpoint "
+            "or set allow_stats_mismatch=True only for explicit debugging."
+        )
+
     action_q50 = list(torch.as_tensor(eval_stats["action"].get("q50", [])).cpu().flatten().tolist())
     state_q50 = list(torch.as_tensor(eval_stats["observation.state"].get("q50", [])).cpu().flatten().tolist())
     dataset_action_q50 = list(torch.as_tensor(ds_meta.stats["action"].get("q50", [])).cpu().flatten().tolist())
@@ -266,6 +345,7 @@ def serve(
         "dataset_action_q50": dataset_action_q50,
         "state_q50": state_q50,
         "stats_warning": stats_warning,
+        "stats_global_check": stats_global_check,
     }
 
     def decode_image(b64_str: str, shape=None):
@@ -442,8 +522,15 @@ def main(
     stun_server: str = "stun.l.google.com:19302",
     checkpoint_repo_id: str | None = None,
     dataset_repo_id: str | None = None,
+    allow_stats_mismatch: bool = False,
 ):
     print(f"Launching Modal QUIC server (session_id={session_id!r}). "
           "Run eval_pi0_quic.py with the same --session-id.")
-    result = serve.remote(session_id, stun_server, checkpoint_repo_id, dataset_repo_id)
+    result = serve.remote(
+        session_id,
+        stun_server,
+        checkpoint_repo_id,
+        dataset_repo_id,
+        allow_stats_mismatch,
+    )
     print(f"\nDone: {result}")

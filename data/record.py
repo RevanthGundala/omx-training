@@ -416,9 +416,14 @@ def main():
                 while not save_ep.is_set() and not discard_ep.is_set():
                     # Keep teleop alive while waiting
                     loop_start = time.perf_counter()
-                    action = leader.get_action()
-                    follower.send_action(action)
-                    observation = follower.get_observation()
+                    try:
+                        action = leader.get_action()
+                        follower.send_action(action)
+                        observation = follower.get_observation()
+                    except ConnectionError as e:
+                        print(f"\n  ⚠️  USB glitch during review (retrying): {e}")
+                        time.sleep(0.05)
+                        continue
                     camera_preview.show(observation)
 
                     if replay_ep.is_set():
@@ -445,7 +450,7 @@ def main():
                 continue
 
             # Save the episode
-            dataset.save_episode()
+            dataset.save_episode(parallel_encoding=False)
             episode += 1
             print(f"  ✓ Episode saved! (Total episodes: {dataset.num_episodes})")
 
@@ -456,9 +461,14 @@ def main():
                 while time.perf_counter() - start < RESET_DURATION_S:
                     remaining = RESET_DURATION_S - (time.perf_counter() - start)
                     print(f"  Next episode in {remaining:.0f}s...", end="\r")
-                    action = leader.get_action()
-                    follower.send_action(action)
-                    observation = follower.get_observation()
+                    try:
+                        action = leader.get_action()
+                        follower.send_action(action)
+                        observation = follower.get_observation()
+                    except ConnectionError as e:
+                        print(f"\n  ⚠️  USB glitch during reset (retrying): {e}")
+                        time.sleep(0.05)
+                        continue
                     camera_preview.show(observation)
                     maintain_fps(time.perf_counter(), FPS)
             except KeyboardInterrupt:

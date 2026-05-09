@@ -157,7 +157,7 @@ def _build_onstart_script() -> str:
     naturally appears in vast.logs() and the Vast.ai dashboard.
     """
     return r'''#!/bin/bash
-set -e
+set -euo pipefail
 export PYTHONUNBUFFERED=1
 trap 'status=$?; if [ $status -ne 0 ]; then echo "=== REMOTE FAILED (exit ${{status}}) ==="; fi' EXIT
 
@@ -239,6 +239,7 @@ echo "=== Starting PI0.5 finetuning (stock lerobot-train CLI) ==="
 # Output is teed to /workspace/train.log so we can `vastai logs` or ssh tail it.
 lerobot-train \
     --dataset.repo_id={dataset_repo_id} \
+    --dataset.root=/root/.cache/huggingface/lerobot/{dataset_root_name} \
     --policy.type={policy_type} \
     --output_dir={output_dir} \
     --job_name={job_name} \

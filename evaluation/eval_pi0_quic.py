@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+from datetime import datetime
 import json
+from pathlib import Path
+import subprocess
 import threading
 import time
 
+import cv2
 import numpy as np
 import rerun as rr
 
@@ -29,6 +34,196 @@ from evaluation.eval_pi0 import RTCActionQueue
 from evaluation.eval_pi0 import RTC_IDLE_SLEEP_S, RTC_QUEUE_REFILL_THRESHOLD
 
 START_DELAY_S = 3
+
+
+class EvalVideoRecorder:
+    def __init__(self, run_dir: Path, fps: int):
+        self.run_dir = run_dir
+        self.fps = fps
+        self.writers: dict[str, cv2.VideoWriter] = {}
+
+    def write(self, observation: dict) -> None:
+        for cam_name in CAMERAS:
+            if cam_name not in observation:
+                continue
+            rgb = observation[cam_name]
+            height, width = rgb.shape[:2]
+            writer = self.writers.get(cam_name)
+            if writer is None:
+                path = self.run_dir / f"{cam_name}.mp4"
+                writer = cv2.VideoWriter(
+                    str(path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    float(self.fps),
+                    (width, height),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"Could not open eval video writer: {path}")
+                self.writers[cam_name] = writer
+            writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+    def close(self) -> None:
+        for writer in self.writers.values():
+            writer.release()
+        self.writers.clear()
+
+
+def transcode_eval_videos_for_browser(run_dir: Path) -> None:
+    for camera in CAMERAS:
+        path = run_dir / f"{camera}.mp4"
+        if not path.exists():
+            continue
+        tmp = run_dir / f"{camera}.h264.tmp.mp4"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(path),
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-movflags",
+                "+faststart",
+                str(tmp),
+            ],
+            check=True,
+        )
+        tmp.replace(path)
+
+
+class EvalRunLogger:
+    def __init__(self, run_dir: Path):
+        self.run_dir = run_dir
+        self.requests_dir = run_dir / "inference_requests"
+        self.requests_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._request_index = 0
+        self._control_file = (run_dir / "control_steps.csv").open("w", newline="", encoding="utf-8")
+        self._request_file = (run_dir / "inference_requests.csv").open("w", newline="", encoding="utf-8")
+        self._control_writer: csv.DictWriter | None = None
+        self._request_writer = csv.DictWriter(
+            self._request_file,
+            fieldnames=[
+                "request_id",
+                "step",
+                "t_monotonic",
+                "rtt_ms",
+                "request_kb",
+                "response_kb",
+                "queue_before",
+                "request_steps_consumed",
+                "estimated_delay",
+                "prev_steps_consumed",
+                "actual_skip",
+                "qsize_after",
+                "server_inference_delay",
+                "server_prev_steps_consumed",
+                "server_prev_chunk_exists",
+                *[f"first_action_{name}" for name in JOINT_NAMES],
+            ],
+        )
+        self._request_writer.writeheader()
+
+    def log_control_step(
+        self,
+        *,
+        step: int,
+        time_s: float,
+        hz: float,
+        qsize: int,
+        observation_state: np.ndarray,
+        policy_action: np.ndarray,
+        sent_action: dict,
+    ) -> None:
+        row = {
+            "step": step,
+            "time_s": time_s,
+            "hz": hz,
+            "qsize": qsize,
+        }
+        for i, name in enumerate(JOINT_NAMES):
+            row[f"state_{name}"] = float(observation_state[i])
+            row[f"policy_action_{name}"] = float(policy_action[i])
+            row[f"sent_action_{name}"] = float(sent_action[f"{name}.pos"])
+
+        if self._control_writer is None:
+            self._control_writer = csv.DictWriter(self._control_file, fieldnames=list(row))
+            self._control_writer.writeheader()
+        self._control_writer.writerow(row)
+        if step % 30 == 0:
+            self._control_file.flush()
+
+    def log_inference_request(
+        self,
+        *,
+        step: int,
+        request_payload: bytes,
+        response: dict,
+        rtt_ms: float,
+        queue_before: int,
+        request_steps_consumed: int,
+        estimated_delay: int,
+        prev_steps_consumed: int,
+        actual_skip: int,
+        qsize_after: int,
+    ) -> None:
+        with self._lock:
+            request_id = self._request_index
+            self._request_index += 1
+
+        request_dir = self.requests_dir / f"request-{request_id:04d}"
+        request_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = json.loads(request_payload)
+        for cam_name in CAMERAS:
+            key = f"image_{cam_name}"
+            if key in payload:
+                image_path = request_dir / f"{cam_name}.jpg"
+                image_path.write_bytes(base64.b64decode(payload[key]))
+                payload[key] = image_path.name
+
+        np.save(request_dir / "state.npy", np.asarray(payload["state"], dtype=np.float32))
+        actions = np.asarray(response.get("actions", []), dtype=np.float32)
+        np.save(request_dir / "actions.npy", actions)
+        (request_dir / "request.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        (request_dir / "response.json").write_text(json.dumps(response, indent=2), encoding="utf-8")
+
+        debug = response.get("debug", {})
+        row = {
+            "request_id": request_id,
+            "step": step,
+            "t_monotonic": time.perf_counter(),
+            "rtt_ms": rtt_ms,
+            "request_kb": len(request_payload) / 1024,
+            "response_kb": len(json.dumps(response).encode("utf-8")) / 1024,
+            "queue_before": queue_before,
+            "request_steps_consumed": request_steps_consumed,
+            "estimated_delay": estimated_delay,
+            "prev_steps_consumed": prev_steps_consumed,
+            "actual_skip": actual_skip,
+            "qsize_after": qsize_after,
+            "server_inference_delay": debug.get("inference_delay"),
+            "server_prev_steps_consumed": debug.get("prev_steps_consumed"),
+            "server_prev_chunk_exists": debug.get("prev_chunk_exists"),
+        }
+        if actions.size:
+            for i, name in enumerate(JOINT_NAMES):
+                row[f"first_action_{name}"] = float(actions[0, i])
+        with self._lock:
+            self._request_writer.writerow(row)
+            self._request_file.flush()
+
+    def close(self) -> None:
+        self._control_file.close()
+        self._request_file.close()
 
 
 def _build_follower():
@@ -104,6 +299,18 @@ def main():
     )
     parser.add_argument("--session-id", type=str, required=True)
     parser.add_argument("--stun", type=str, default="stun.l.google.com:19302")
+    parser.add_argument(
+        "--eval-output-root",
+        type=Path,
+        default=Path("outputs/eval_runs"),
+        help="Directory where each eval run saves videos, metadata, and debug CSV.",
+    )
+    parser.add_argument(
+        "--no-save-videos",
+        action="store_true",
+        help="Disable per-camera MP4 recording for this eval run.",
+    )
+    parser.add_argument("--notes", type=str, default="", help="Optional scene notes saved to metadata.json.")
     args = parser.parse_args()
 
     print(f"Connecting QUIC for session={args.session_id!r} ...")
@@ -142,6 +349,28 @@ def main():
 
     init_rerun("omx_eval_pi05_quic", save_rrd=True)
 
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{args.session_id}"
+    run_dir = args.eval_output_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "session_id": args.session_id,
+                "stun": args.stun,
+                "fps": FPS,
+                "cameras": list(CAMERAS.keys()),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "outcome_label": "",
+                "notes": args.notes,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    video_recorder = None if args.no_save_videos else EvalVideoRecorder(run_dir, FPS)
+    run_logger = EvalRunLogger(run_dir)
+    print(f"Eval artifacts will be saved under: {run_dir}")
+
     try:
         quic_client.request(json.dumps({"op": "reset"}).encode("utf-8"), 10.0)
     except Exception:
@@ -152,11 +381,12 @@ def main():
     obs_lock = threading.Lock()
     latest_observation = None
     latest_observation_frame = None
+    latest_step = -1
     inference_running = threading.Event()
     stop_event = threading.Event()
 
     def _inference_loop():
-        nonlocal latest_observation, latest_observation_frame
+        nonlocal latest_observation, latest_observation_frame, latest_step
         while not stop_event.is_set():
             with obs_lock:
                 obs = latest_observation
@@ -176,6 +406,7 @@ def main():
             with obs_lock:
                 obs_snapshot = {k: v for k, v in latest_observation.items()}
                 frame_snapshot = latest_observation_frame
+                step_snapshot = latest_step
             estimated_delay = max(0, min(last_round_trip_delay, action_queue.chunk_size - 1))
             prev_steps_consumed = max(
                 0, min(request_steps_consumed, action_queue.chunk_size - 1)
@@ -205,6 +436,18 @@ def main():
                       f"prev_chunk={dbg.get('prev_chunk_exists')}")
                 actions = np.array(data["actions"], dtype=np.float32)
                 actual_skip = action_queue.replace_after_request(actions, request_steps_consumed)
+                run_logger.log_inference_request(
+                    step=step_snapshot,
+                    request_payload=req,
+                    response=data,
+                    rtt_ms=rtt_ms,
+                    queue_before=queue_size,
+                    request_steps_consumed=request_steps_consumed,
+                    estimated_delay=estimated_delay,
+                    prev_steps_consumed=prev_steps_consumed,
+                    actual_skip=actual_skip,
+                    qsize_after=action_queue.qsize(),
+                )
                 print(
                     f"  [rtc] prev_steps={prev_steps_consumed} "
                     f"est_delay={estimated_delay} actual_skip={actual_skip} "
@@ -232,7 +475,6 @@ def main():
         run_start = time.perf_counter()
         step = 0
         frozen_joint_targets: dict[str, float] = {}
-        debug_log = open("outputs/eval_quic_debug.csv", "w")
 
         while True:
             loop_start = time.perf_counter()
@@ -240,6 +482,8 @@ def main():
             for cam_name in CAMERAS:
                 if cam_name in observation:
                     ensure_camera_size(observation, key=cam_name)
+            if video_recorder is not None:
+                video_recorder.write(observation)
 
             observation_frame = build_dataset_frame(
                 dataset_features, observation, prefix="observation",
@@ -247,6 +491,7 @@ def main():
             with obs_lock:
                 latest_observation = observation
                 latest_observation_frame = observation_frame
+                latest_step = step
 
             action_values = action_queue.get()
             if action_values is None:
@@ -265,14 +510,16 @@ def main():
             maintain_fps(loop_start, FPS)
             loop_dt = time.perf_counter() - loop_start
             hz = 1.0 / loop_dt if loop_dt > 0 else float("inf")
-
-            if step == 0:
-                joint_headers = ",".join(JOINT_NAMES)
-                debug_log.write(f"step,hz,qsize,{joint_headers}\n")
-            vals = ",".join(f"{action_values[i]:.4f}" for i in range(len(JOINT_NAMES)))
-            debug_log.write(f"{step},{hz:.1f},{action_queue.qsize()},{vals}\n")
-            if step % 30 == 0:
-                debug_log.flush()
+            observation_state = np.asarray(observation_frame["observation.state"], dtype=np.float32)
+            run_logger.log_control_step(
+                step=step,
+                time_s=time.perf_counter() - run_start,
+                hz=hz,
+                qsize=action_queue.qsize(),
+                observation_state=observation_state,
+                policy_action=action_values,
+                sent_action=sent_action,
+            )
 
             rr.set_time_sequence("step", step)
             rr.set_time_seconds("time", time.perf_counter() - run_start)
@@ -298,14 +545,17 @@ def main():
     except KeyboardInterrupt:
         print("\n\nStopping Pi0 QUIC eval...")
     finally:
-        debug_log.close()
-        print("Debug log saved to outputs/eval_quic_debug.csv")
         stop_event.set()
-        inference_thread.join(timeout=5)
         try:
             quic_client.close()
         except Exception:
             pass
+        inference_thread.join(timeout=5)
+        run_logger.close()
+        if video_recorder is not None:
+            video_recorder.close()
+            transcode_eval_videos_for_browser(run_dir)
+        print(f"Eval artifacts saved to {run_dir}")
         safe_disconnect(follower)
         print("Disconnected. Done!")
 
