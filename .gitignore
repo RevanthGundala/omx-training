@@ -6,4 +6,5 @@ outputs/
 episodes_h264/
 *.mp4
 *.png
+*.pt
 .venv/

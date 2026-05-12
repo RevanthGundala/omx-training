@@ -30,7 +30,7 @@ hf_secret = modal.Secret.from_name("huggingface")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04", add_python="3.12")
-    .apt_install("git", "ffmpeg")
+    .apt_install("git", "ffmpeg", "linux-libc-dev", "clang")
     .pip_install(
         "torch",
         "torchvision",
@@ -81,8 +81,7 @@ def format_command(command: list[str]) -> str:
 
 
 def preflight_profile(profile: str) -> None:
-    import urllib.error
-    import urllib.request
+    from huggingface_hub import HfApi
 
     config = load_profile(profile)
     config_dict = asdict(config)
@@ -101,10 +100,18 @@ def preflight_profile(profile: str) -> None:
     print("  command:")
     print(format_command(command))
 
-    if config.policy_pretrained_path == "lerobot/pi05_base":
-        raise ValueError(f"{profile} starts from lerobot/pi05_base; expected the current 3k checkpoint")
-    if config.policy_pretrained_path != "RevanthGundala/pi05-pour-water-3k":
-        raise ValueError(f"{profile} uses unexpected checkpoint: {config.policy_pretrained_path}")
+    base_adaptation_profiles = {
+        "pour_absolute_globalstats",
+        "pour_absolute_new20_from_base_globalstats",
+        "pour_absolute_new35_from_base_globalstats",
+        "pour_absolute_new40_from_base_globalstats",
+    }
+    if config.policy_pretrained_path == "lerobot/pi05_base" and profile not in base_adaptation_profiles:
+        raise ValueError(
+            f"{profile} starts from lerobot/pi05_base, but this profile is not marked as a base adaptation."
+        )
+    if config.policy_pretrained_path != "lerobot/pi05_base" and not config.policy_pretrained_path.startswith("RevanthGundala/"):
+        raise ValueError(f"{profile} uses unexpected checkpoint namespace: {config.policy_pretrained_path}")
     if config.use_relative_actions:
         raise ValueError(f"{profile} must be absolute-action, but use_relative_actions=True")
     if config.batch_size != 32:
@@ -112,23 +119,10 @@ def preflight_profile(profile: str) -> None:
     if config.compile_model:
         raise ValueError(f"{profile} has compile_model=True; expected False")
 
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    if not token:
-        print("  HF repo checks skipped locally because HF_TOKEN is not set; Modal uses the 'huggingface' secret remotely.")
-        return
-
-    for repo_id, repo_type in (
-        (config.dataset_repo_id, "datasets"),
-        (config.policy_pretrained_path, "models"),
-    ):
-        url = f"https://huggingface.co/api/{repo_type}/{repo_id}"
-        headers = {"Authorization": f"Bearer {token}"}
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Unexpected HTTP {response.status} for {url}")
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Hugging Face repo check failed for {repo_id}: HTTP {exc.code}") from exc
+    api = HfApi()
+    api.dataset_info(config.dataset_repo_id, revision=config.dataset_revision)
+    if config.policy_pretrained_path != "lerobot/pi05_base":
+        api.model_info(config.policy_pretrained_path)
 
 
 @app.function(gpu=MODAL_GPU, timeout=14400, memory=32768, secrets=[hf_secret])

@@ -169,7 +169,7 @@ mkdir -p /workspace
 cd /workspace
 
 # Ubuntu 24.04 base image — has Python 3.12 by default. Install pip + torch.
-apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv ffmpeg > /dev/null 2>&1
+apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv ffmpeg linux-libc-dev clang > /dev/null 2>&1
 ln -sf /usr/bin/python3 /usr/local/bin/python || true
 
 # Use a venv to avoid PEP 668 externally-managed errors on Ubuntu 24.04.

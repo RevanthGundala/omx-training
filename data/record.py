@@ -22,7 +22,6 @@ import shutil
 from pathlib import Path
 
 import cv2
-import cv2
 import multiprocessing as mp
 import numpy as np
 import rerun as rr
@@ -32,6 +31,13 @@ from pynput import keyboard
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 
+from data.scene_assist import (
+    DEFAULT_MODEL as SCENE_ASSIST_DEFAULT_MODEL,
+    analyze_start_scene,
+    format_coverage_summary,
+    format_preflight_report,
+    save_scene_artifacts,
+)
 from utils.config import CAMERAS, FPS, JOINT_NAMES, RECORD_DATASET_REPO_ID as DATASET_REPO_ID, TASK_NAME
 from utils.control_utils import maintain_fps
 from utils.rerun_utils import init_rerun
@@ -39,6 +45,28 @@ from utils.robot_utils import create_follower, create_leader, safe_disconnect
 
 USE_RERUN = False  # Set True to enable Rerun visualizer (adds latency)
 SHOW_CAMERAS = True  # Live camera preview via OpenCV (minimal latency)
+SAVE_START_SCENE_ARTIFACTS = True
+SCENE_ASSIST_ENABLED = True
+SCENE_ASSIST_TOP_CAMERA = "top"
+SCENE_ASSIST_MODEL = SCENE_ASSIST_DEFAULT_MODEL
+SCENE_ASSIST_MIN_CONFIDENCE = 0.25
+SCENE_ASSIST_TARGET_COUNT = 4
+SCENE_ASSIST_MIN_EPISODE_INDEX = 50
+SCENE_DIVERSITY_DIR = Path("outputs/record_scene_diversity")
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+RED = "\033[91m"
+
+
+def color(text: str, ansi: str) -> str:
+    return f"{ansi}{text}{RESET}"
 
 
 def _camera_display_worker(frame_queue: mp.Queue, stop_event):
@@ -85,7 +113,7 @@ class CameraPreview:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 panels.append(img)
         if panels:
-            combined = np.hstack(panels) if len(panels) > 1 else panels[0]
+            combined = np.vstack(panels) if len(panels) > 1 else panels[0]
             # Drop old frame if display is behind
             if self._queue.full():
                 try:
@@ -113,6 +141,127 @@ class CameraPreview:
 
 # Global camera preview instance
 camera_preview = CameraPreview()
+
+
+# ──────────────────────────────────────────────
+# Object-centric start-scene assistant
+# ──────────────────────────────────────────────
+
+def _dataset_artifact_dir() -> Path:
+    return SCENE_DIVERSITY_DIR / DATASET_REPO_ID.replace("/", "__")
+
+
+def bootstrap_scene_diversity_artifacts(dataset_root: Path) -> None:
+    if not SCENE_ASSIST_ENABLED or not USE_CAMERA:
+        return
+
+    artifact_root = _dataset_artifact_dir()
+    print(color(f"  Scene assistant artifacts: {artifact_root}", CYAN))
+    print(color(f"  Scene assistant coverage: episodes {SCENE_ASSIST_MIN_EPISODE_INDEX}+ only (ignoring earlier episodes).", DIM))
+
+    try:
+        import pandas as pd
+
+        episode_files = sorted((dataset_root / "meta" / "episodes").glob("**/*.parquet"))
+        if not episode_files:
+            return
+        episodes = (
+            pd.concat([pd.read_parquet(path) for path in episode_files], ignore_index=True)
+            .sort_values("episode_index")
+        )
+    except Exception as e:
+        print(color(f"  ⚠️  Scene assistant bootstrap skipped: {e}", YELLOW))
+        return
+
+    created = 0
+    for _, row in episodes.iterrows():
+        episode_index = int(row["episode_index"])
+        if episode_index < SCENE_ASSIST_MIN_EPISODE_INDEX:
+            continue
+        if (artifact_root / f"episode-{episode_index:04d}.scene.json").exists():
+            continue
+
+        observation = {}
+        for cam_name in CAMERAS:
+            prefix = f"videos/observation.images.{cam_name}"
+            required = [f"{prefix}/chunk_index", f"{prefix}/file_index", f"{prefix}/from_timestamp"]
+            if not all(key in row for key in required):
+                continue
+            video_path = (
+                dataset_root
+                / "videos"
+                / f"observation.images.{cam_name}"
+                / f"chunk-{int(row[f'{prefix}/chunk_index']):03d}"
+                / f"file-{int(row[f'{prefix}/file_index']):03d}.mp4"
+            )
+            if not video_path.exists():
+                continue
+            cap = cv2.VideoCapture(str(video_path))
+            try:
+                frame_index = max(0, int(float(row[f"{prefix}/from_timestamp"]) * FPS))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, bgr = cap.read()
+            finally:
+                cap.release()
+            if ok:
+                observation[cam_name] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        top_frame = observation.get(SCENE_ASSIST_TOP_CAMERA)
+        if not isinstance(top_frame, np.ndarray):
+            continue
+        try:
+            report = analyze_start_scene(
+                top_frame,
+                episode_index=episode_index,
+                scene_root=artifact_root,
+                model_path=SCENE_ASSIST_MODEL,
+                min_confidence=SCENE_ASSIST_MIN_CONFIDENCE,
+                target_count=SCENE_ASSIST_TARGET_COUNT,
+                min_episode_index=SCENE_ASSIST_MIN_EPISODE_INDEX,
+            )
+            report["bootstrapped_from_dataset"] = True
+            save_scene_artifacts(artifact_root, episode_index, observation, report, tuple(CAMERAS.keys()))
+            created += 1
+        except Exception as e:
+            print(color(f"  ⚠️  Scene assistant skipped episode {episode_index}: {e}", YELLOW))
+
+    if created:
+        print(color(f"  Bootstrapped {created} start-scene checks from episodes {SCENE_ASSIST_MIN_EPISODE_INDEX}+.", CYAN))
+
+
+def start_scene_preflight(robot, episode_index: int) -> dict | None:
+    if not SAVE_START_SCENE_ARTIFACTS or not USE_CAMERA or not SCENE_ASSIST_ENABLED:
+        return None
+
+    root = _dataset_artifact_dir()
+    try:
+        observation = robot.get_observation()
+    except ConnectionError as e:
+        print(color(f"\n  ⚠️  USB glitch during start-scene capture: {e}", YELLOW))
+        return None
+    camera_preview.show(observation)
+
+    top_frame = observation.get(SCENE_ASSIST_TOP_CAMERA)
+    if not isinstance(top_frame, np.ndarray):
+        print(color(f"\n  ⚠️  Scene assistant skipped: missing {SCENE_ASSIST_TOP_CAMERA!r} camera frame.", YELLOW))
+        return {"observation": observation, "report": {"episode_index": episode_index, "error": "missing_top_frame"}}
+
+    try:
+        report = analyze_start_scene(
+            top_frame,
+            episode_index=episode_index,
+            scene_root=root,
+            model_path=SCENE_ASSIST_MODEL,
+            min_confidence=SCENE_ASSIST_MIN_CONFIDENCE,
+            target_count=SCENE_ASSIST_TARGET_COUNT,
+            min_episode_index=SCENE_ASSIST_MIN_EPISODE_INDEX,
+        )
+    except Exception as e:
+        report = {"episode_index": episode_index, "error": str(e)}
+
+    report["operator_decision"] = "auto_record"
+    print(format_preflight_report(report))
+    return {"observation": observation, "report": report}
 
 # ──────────────────────────────────────────────
 # Replay from buffer helper
@@ -204,11 +353,11 @@ def soft_start(follower, leader, duration_s=SOFT_START_DURATION_S):
 def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
     """Record a single episode. Returns (frame_count, action_buffer, state_buffer, rerun_step).
     frame_count = -1 means discard was pressed during recording."""
-    print(f"\n{'='*60}")
-    print(f"  RECORDING Episode {episode_num}")
-    print(f"  Task: {TASK_NAME}")
-    print(f"  Max duration: {EPISODE_DURATION_S}s — → stop & review, ← discard")
-    print(f"{'='*60}\n")
+    print(color(f"\n{'='*60}", BLUE))
+    print(color(f"  RECORDING Episode {episode_num}", BOLD + BLUE))
+    print(color(f"  Task: {TASK_NAME}", BLUE))
+    print(color(f"  Max duration: {EPISODE_DURATION_S}s — → stop & review, ← discard", BLUE))
+    print(color(f"{'='*60}\n", BLUE))
 
     end_episode = threading.Event()
     discard_episode = threading.Event()
@@ -241,7 +390,7 @@ def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
                 action = leader.get_action()
                 sent_action = robot.send_action(action)
             except ConnectionError as e:
-                print(f"\n  ⚠️  USB glitch (retrying): {e}")
+                print(color(f"\n  ⚠️  USB glitch (retrying): {e}", YELLOW))
                 time.sleep(0.05)
                 continue
 
@@ -277,7 +426,7 @@ def record_one_episode(robot, leader, dataset, episode_num, rerun_step=0):
             maintain_fps(loop_start, FPS)
 
     except KeyboardInterrupt:
-        print(f"\n  Episode ended early by user.")
+        print(color(f"\n  Episode ended early by user.", YELLOW))
     finally:
         listener.stop()
 
@@ -352,6 +501,8 @@ def main():
             image_writer_threads=4,
         )
 
+    bootstrap_scene_diversity_artifacts(dataset_path)
+
     # Connect hardware
     print("\nConnecting leader arm...")
     leader.connect()
@@ -373,30 +524,34 @@ def main():
     rerun_step = 0
     try:
         while episode < NUM_EPISODES:
+            scene_report = start_scene_preflight(follower, dataset.num_episodes)
+            if scene_report is not None and scene_report.get("report", {}).get("operator_decision") == "quit":
+                print("\n  Scene assistant quit requested.")
+                break
             try:
                 result = record_one_episode(follower, leader, dataset, dataset.num_episodes, rerun_step)
             except Exception as e:
-                print(f"\n  ⚠️  Episode error: {e}")
+                print(color(f"\n  ⚠️  Episode error: {e}", RED))
                 import traceback; traceback.print_exc()
                 dataset.clear_episode_buffer()
                 continue
             frame_count, action_buf, state_buf, action_names, state_names, rerun_step = result
 
             if frame_count == 0:
-                print("  No frames recorded, skipping episode.")
+                print(color("  No frames recorded, skipping episode.", YELLOW))
                 dataset.clear_episode_buffer()
                 continue
 
             if frame_count < 0:
-                print("  ← Episode DISCARDED.")
+                print(color("  ← Episode DISCARDED.", RED))
                 try:
                     dataset.clear_episode_buffer()
                 except Exception as e:
-                    print(f"  ⚠️  clear_episode_buffer error: {e}")
+                    print(color(f"  ⚠️  clear_episode_buffer error: {e}", YELLOW))
                 continue
 
             # ── Review phase: replay/save/discard ──
-            print(f"\n  REVIEW: ↑ replay, → save, ← discard")
+            print(color(f"\n  REVIEW: ↑ replay, → save, ← discard", MAGENTA))
             save_ep = threading.Event()
             discard_ep = threading.Event()
             replay_ep = threading.Event()
@@ -421,7 +576,7 @@ def main():
                         follower.send_action(action)
                         observation = follower.get_observation()
                     except ConnectionError as e:
-                        print(f"\n  ⚠️  USB glitch during review (retrying): {e}")
+                        print(color(f"\n  ⚠️  USB glitch during review (retrying): {e}", YELLOW))
                         time.sleep(0.05)
                         continue
                     camera_preview.show(observation)
@@ -433,7 +588,7 @@ def main():
                             follower, FPS,
                         )
                         soft_start(follower, leader)
-                        print(f"  REVIEW: ↑ replay again, → save, ← discard")
+                        print(color(f"  REVIEW: ↑ replay again, → save, ← discard", MAGENTA))
 
                     maintain_fps(loop_start, FPS)
             except KeyboardInterrupt:
@@ -445,17 +600,28 @@ def main():
                 review_listener.stop()
 
             if discard_ep.is_set():
-                print("  ← Episode DISCARDED.")
+                print(color("  ← Episode DISCARDED.", RED))
                 dataset.clear_episode_buffer()
                 continue
 
             # Save the episode
+            committed_episode_index = dataset.num_episodes
             dataset.save_episode(parallel_encoding=False)
+            if scene_report is not None:
+                save_scene_artifacts(
+                    _dataset_artifact_dir(),
+                    committed_episode_index,
+                    scene_report["observation"],
+                    scene_report["report"],
+                    tuple(CAMERAS.keys()),
+                )
             episode += 1
-            print(f"  ✓ Episode saved! (Total episodes: {dataset.num_episodes})")
+            print(color(f"  ✓ Episode saved! (Total episodes: {dataset.num_episodes})", GREEN))
+            if scene_report is not None:
+                print(color(f"  Scene diversity artifacts: {_dataset_artifact_dir()}", DIM))
 
             # Brief reset period
-            print(f"\n  Resetting for {RESET_DURATION_S}s... (Ctrl+C to stop)")
+            print(color(f"\n  Resetting for {RESET_DURATION_S}s... (Ctrl+C to stop)", CYAN))
             try:
                 start = time.perf_counter()
                 while time.perf_counter() - start < RESET_DURATION_S:
@@ -466,7 +632,7 @@ def main():
                         follower.send_action(action)
                         observation = follower.get_observation()
                     except ConnectionError as e:
-                        print(f"\n  ⚠️  USB glitch during reset (retrying): {e}")
+                        print(color(f"\n  ⚠️  USB glitch during reset (retrying): {e}", YELLOW))
                         time.sleep(0.05)
                         continue
                     camera_preview.show(observation)
@@ -487,9 +653,9 @@ def main():
         # ("Parquet magic bytes not found in footer" on resume/load).
         try:
             dataset.finalize()
-            print(f"Dataset finalized: {dataset.num_episodes} episodes committed.")
+            print(color(f"Dataset finalized: {dataset.num_episodes} episodes committed.", GREEN))
         except Exception as e:
-            print(f"WARNING: dataset.finalize() failed: {e}")
+            print(color(f"WARNING: dataset.finalize() failed: {e}", YELLOW))
 
     # Push to hub (optional)
     if PUSH_TO_HUB:

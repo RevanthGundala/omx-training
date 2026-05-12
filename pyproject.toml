@@ -10,6 +10,7 @@ dependencies = [
     "vastai-sdk>=0.2",
     "pytest>=9.0.3",
     "modal>=1.4.1",
+    "ultralytics>=8.3",
 ]
 
 [build-system]
