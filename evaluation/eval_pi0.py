@@ -19,10 +19,9 @@ import numpy as np
 import rerun as rr
 import requests
 
-from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
-
 from utils.config import CAMERAS, FPS, JOINT_NAMES, TASK_NAME
 from utils.control_utils import ensure_camera_size, maintain_fps
+from utils.lerobot_compat import build_dataset_frame, hw_to_dataset_features
 from utils.rerun_utils import init_rerun
 from utils.robot_utils import create_follower, safe_disconnect
 

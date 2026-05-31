@@ -11,6 +11,7 @@ import time
 from dynamixel_sdk import PacketHandler, PortHandler
 
 from utils.config import LEADER_PORT, FOLLOWER_PORT
+from utils.dynamixel_errors import HW_ERROR_BITS
 
 PORTS = [LEADER_PORT, FOLLOWER_PORT]
 BAUDRATE = 1_000_000
@@ -20,15 +21,6 @@ REBOOT_WAIT_S = 2
 
 TORQUE_ENABLE_ADDR = 64
 HW_ERROR_ADDR = 70
-HW_ERROR_BITS = {
-    0: "Input Voltage",
-    2: "Overheating",
-    3: "Motor Encoder",
-    4: "Electrical Shock",
-    5: "Overload",
-}
-
-
 def scan_and_reboot(port: str) -> None:
     ph = PortHandler(port)
     if not ph.openPort():

@@ -1,8 +1,8 @@
 """Shared configuration constants for OMX training scripts."""
 
 # ── Hardware Ports ──
-LEADER_PORT = "/dev/tty.usbmodem1301"
-FOLLOWER_PORT = "/dev/tty.usbmodem1401"
+LEADER_PORT = "/dev/tty.usbmodem11301"
+FOLLOWER_PORT = "/dev/tty.usbmodem11401"
 
 # ── Joint Configuration ──
 JOINT_NAMES = [

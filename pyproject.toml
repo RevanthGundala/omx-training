@@ -11,6 +11,7 @@ dependencies = [
     "pytest>=9.0.3",
     "modal>=1.4.1",
     "ultralytics>=8.3",
+    "transformers>=5.9.0",
 ]
 
 [build-system]
@@ -22,3 +23,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["utils", "calibration", "control", "data", "deploy", "diagnostics", "evaluation", "training", "rlt", "tests"]
+
+[tool.uv.sources]
+lerobot = { git = "https://github.com/huggingface/lerobot.git", rev = "main" }

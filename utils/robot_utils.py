@@ -23,6 +23,7 @@ from utils.config import (
     FPS,
     LEADER_PORT,
 )
+from utils.omx_feedback_leader import OmxFeedbackLeader
 
 
 def create_follower(
@@ -49,10 +50,12 @@ def create_follower(
     return OmxFollower(config)
 
 
-def create_leader(port: str | None = None) -> OmxLeader:
-    """Create a stock OmxLeader."""
+def create_leader(port: str | None = None, *, feedback: bool = False, event_callback=None) -> OmxLeader:
+    """Create an OmxLeader, optionally with DAgger feedback support."""
     port = port or LEADER_PORT
     config = OmxLeaderConfig(port=port, id="omx_leader_arm")
+    if feedback:
+        return OmxFeedbackLeader(config, event_callback=event_callback)
     return OmxLeader(config)
 
 

@@ -29,7 +29,6 @@ from huggingface_hub import HfApi
 from pynput import keyboard
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
 
 from data.scene_assist import (
     DEFAULT_MODEL as SCENE_ASSIST_DEFAULT_MODEL,
@@ -40,6 +39,7 @@ from data.scene_assist import (
 )
 from utils.config import CAMERAS, FPS, JOINT_NAMES, RECORD_DATASET_REPO_ID as DATASET_REPO_ID, TASK_NAME
 from utils.control_utils import maintain_fps
+from utils.lerobot_compat import build_dataset_frame, hw_to_dataset_features
 from utils.rerun_utils import init_rerun
 from utils.robot_utils import create_follower, create_leader, safe_disconnect
 

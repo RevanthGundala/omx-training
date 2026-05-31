@@ -12,7 +12,7 @@ response.
 Usage:
   modal run --detach deploy/serve_pi0_quic_modal.py::serve \\
       --session-id my-omx-session
-  python evaluation/eval_pi0_quic.py --session-id my-omx-session
+  python evaluation/dagger_quic.py --session-id my-omx-session
 """
 
 from __future__ import annotations
@@ -525,7 +525,7 @@ def main(
     allow_stats_mismatch: bool = False,
 ):
     print(f"Launching Modal QUIC server (session_id={session_id!r}). "
-          "Run eval_pi0_quic.py with the same --session-id.")
+          "Run dagger_quic.py with the same --session-id.")
     result = serve.remote(
         session_id,
         stun_server,

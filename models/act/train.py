@@ -1,0 +1,351 @@
+import argparse
+from dataclasses import asdict
+from datetime import datetime
+from enum import StrEnum
+import importlib
+import json
+from itertools import cycle
+from pathlib import Path
+import random
+
+import torch
+import torch.nn.functional as F
+
+from .act import ACT
+from configs.act.base import ACTConfig
+
+
+class LeRobotFeatureKey(StrEnum):
+    OBSERVATION_STATE = "observation.state"
+    ACTION = "action"
+    ACTION_IS_PAD = "action_is_pad"
+    OBSERVATION_IMAGES_PREFIX = "observation.images."
+
+    @classmethod
+    def camera_image(cls, camera_name: str) -> str:
+        return f"{cls.OBSERVATION_IMAGES_PREFIX}{camera_name}"
+
+
+def load_experiment(profile: str) -> ACTConfig:
+    module = importlib.import_module(f"configs.act.{profile}")
+    config = module.config
+    if not isinstance(config, ACTConfig):
+        raise TypeError(f"configs.act.{profile}.config must be an ACTConfig")
+    return config
+
+
+def resolve_dataset_root(config: ACTConfig) -> Path:
+    return (
+        Path.home()
+        / ".cache"
+        / "huggingface"
+        / "lerobot"
+        / f"{config.dataset_repo_id.replace('/', '__')}__{config.dataset_revision}"
+    )
+
+
+def create_run_dir(config: ACTConfig, run_name: str | None = None) -> Path:
+    run_id = run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = Path(config.output_root) / config.job_name / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def save_config(run_dir: Path, profile: str, config: ACTConfig) -> None:
+    payload = {"profile": profile, **asdict(config)}
+    (run_dir / "config.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def save_checkpoint(
+    run_dir: Path,
+    step: int,
+    model,
+    optimizer,
+    train_loss: float,
+    val_loss: float | None,
+    config: ACTConfig,
+    norm_stats: dict[str, dict[str, torch.Tensor]],
+) -> None:
+    checkpoint = {
+        "step": step,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "config": asdict(config),
+        "norm_stats": {key: {name: value.cpu() for name, value in stats.items()} for key, stats in norm_stats.items()},
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    step_path = run_dir / f"checkpoint_step_{step:06d}.pt"
+    torch.save(checkpoint, step_path)
+    torch.save(checkpoint, run_dir / "checkpoint_last.pt")
+
+
+def main(profile: str = "pour_water", run_name: str | None = None, dry_run: bool = False):
+    config = load_experiment(profile)
+    torch.manual_seed(config.seed)
+    random.seed(config.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    dataset_root = resolve_dataset_root(config)
+    train_loader, val_loader, norm_stats = make_lerobot_dataloaders(config, dataset_root, device)
+    sample_batch = next(iter(train_loader))
+    _, qpos, actions, _ = unpack_lerobot_batch(sample_batch, config.camera_names, norm_stats=None)
+
+    model = ACT(
+        d_model=config.d_model,
+        d_qpos=actions.shape[-1],
+        d_z=config.d_z,
+        chunk_size=actions.shape[1],
+        device=device,
+        num_cameras=len(config.camera_names),
+        num_encoder_layers=config.num_encoder_layers,
+        num_decoder_layers=config.num_decoder_layers,
+        num_heads=config.num_heads,
+        mlp_dim=config.mlp_dim,
+        dropout=config.dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+
+    run_dir = create_run_dir(config, run_name)
+    save_config(run_dir, profile, config)
+    print(f"Profile: {profile}")
+    print(f"Dataset: {config.dataset_repo_id}@{config.dataset_revision}")
+    print(f"Cameras: {config.camera_names}")
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches: {0 if val_loader is None else len(val_loader)}")
+    print(f"Output: {run_dir}")
+    if dry_run:
+        print("Dry run complete; no training performed.")
+        return
+
+    train_iter = cycle(train_loader)
+    last_train_loss = float("nan")
+    last_val_loss = None
+    for step in range(1, config.num_train_steps + 1):
+        set_warmup_lr(optimizer, config.learning_rate, step, config.warmup_steps)
+        batch = next(train_iter)
+        last_train_loss = train_step(
+            model,
+            batch,
+            optimizer,
+            device,
+            config.camera_names,
+            norm_stats,
+            config.kl_weight,
+            config.grad_clip,
+        )
+
+        should_eval = val_loader is not None and (step % config.eval_freq == 0 or step == config.num_train_steps)
+        if should_eval:
+            last_val_loss = evaluate(model, val_loader, device, config.camera_names, norm_stats, config.kl_weight)
+            print(f"Step {step}: train_loss={last_train_loss:.4f} val_loss={last_val_loss:.4f}")
+        elif step % config.eval_freq == 0 or step == 1:
+            print(f"Step {step}: train_loss={last_train_loss:.4f}")
+
+        should_save = step % config.save_freq == 0 or step == config.num_train_steps
+        if should_save:
+            save_checkpoint(run_dir, step, model, optimizer, last_train_loss, last_val_loss, config, norm_stats)
+
+
+def make_lerobot_dataloaders(config: ACTConfig, root: Path, device: torch.device):
+    from huggingface_hub import snapshot_download
+    from lerobot.datasets.factory import resolve_delta_timestamps
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.policies.act.configuration_act import ACTConfig as LeRobotACTConfig
+
+    snapshot_download(
+        repo_id=config.dataset_repo_id,
+        repo_type="dataset",
+        revision=config.dataset_revision,
+        local_dir=root,
+    )
+    act_config = LeRobotACTConfig(
+        output_features={},
+        chunk_size=config.chunk_size,
+        n_action_steps=config.chunk_size,
+    )
+    dataset_meta = LeRobotDatasetMetadata(config.dataset_repo_id, root=root)
+    delta_timestamps = resolve_delta_timestamps(act_config, dataset_meta)
+    dataset = LeRobotDataset(
+        config.dataset_repo_id,
+        root=root,
+        delta_timestamps=delta_timestamps,
+        tolerance_s=1e4,
+    )
+    norm_stats = extract_norm_stats(dataset_meta.stats, device)
+    train_indices, val_indices = build_episode_split_indices(root, config.train_split, config.seed)
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices) if val_indices else None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+    return train_loader, val_loader, norm_stats
+
+
+def extract_norm_stats(dataset_stats: dict, device: torch.device) -> dict[str, dict[str, torch.Tensor]]:
+    norm_stats = {}
+    for key in (LeRobotFeatureKey.OBSERVATION_STATE, LeRobotFeatureKey.ACTION):
+        stats = dataset_stats[key]
+        mean = torch.as_tensor(stats["mean"], dtype=torch.float32, device=device)
+        std = torch.as_tensor(stats["std"], dtype=torch.float32, device=device).clamp_min(1e-6)
+        norm_stats[key] = {"mean": mean, "std": std}
+    return norm_stats
+
+
+def build_episode_split_indices(root: Path, train_split: float, seed: int) -> tuple[list[int], list[int]]:
+    if not 0.0 < train_split <= 1.0:
+        raise ValueError(f"train_split must be in (0, 1], got {train_split}")
+
+    import pandas as pd
+
+    parquet_paths = sorted((root / "data").glob("**/*.parquet"))
+    if not parquet_paths:
+        raise FileNotFoundError(f"No parquet files found under {root / 'data'}")
+
+    frame_tables = [pd.read_parquet(path, columns=["index", "episode_index"]) for path in parquet_paths]
+    frame_table = pd.concat(frame_tables, ignore_index=True)
+    episodes = sorted(int(episode) for episode in frame_table["episode_index"].unique())
+    rng = random.Random(seed)
+    rng.shuffle(episodes)
+
+    if len(episodes) == 1 or train_split == 1.0:
+        train_episodes = set(episodes)
+        val_episodes = set()
+    else:
+        train_count = int(len(episodes) * train_split)
+        train_count = min(max(train_count, 1), len(episodes) - 1)
+        train_episodes = set(episodes[:train_count])
+        val_episodes = set(episodes[train_count:])
+
+    train_indices = frame_table[frame_table["episode_index"].isin(train_episodes)]["index"].astype(int).tolist()
+    val_indices = frame_table[frame_table["episode_index"].isin(val_episodes)]["index"].astype(int).tolist()
+    return train_indices, val_indices
+
+
+def normalize_tensor(value: torch.Tensor, stats: dict[str, torch.Tensor]) -> torch.Tensor:
+    return (value - stats["mean"].to(value.device)) / stats["std"].to(value.device)
+
+
+def unpack_lerobot_batch(batch, camera_names, norm_stats=None):
+    image_tensors = []
+    missing_camera_keys = []
+    for camera_name in camera_names:
+        key = LeRobotFeatureKey.camera_image(camera_name)
+        image = batch.get(key)
+        if image is None:
+            missing_camera_keys.append(key)
+            continue
+        if image.ndim != 4:
+            raise ValueError(f"Expected {key} to have shape [batch, channels, height, width], got {tuple(image.shape)}")
+        if image.shape[1] not in (1, 3, 4) and image.shape[-1] in (1, 3, 4):
+            image = image.permute(0, 3, 1, 2).contiguous()
+        image = image.float()
+        if image.max() > 1.0:
+            image = image / 255.0
+        image_tensors.append(image)
+
+    if missing_camera_keys:
+        available_image_keys = sorted(key for key in batch if key.startswith(LeRobotFeatureKey.OBSERVATION_IMAGES_PREFIX))
+        raise KeyError(
+            f"Batch is missing required camera keys {missing_camera_keys}. "
+            f"Available image keys: {available_image_keys}"
+        )
+
+    images = torch.stack(image_tensors, dim=1)
+    qpos = batch[LeRobotFeatureKey.OBSERVATION_STATE]
+    actions = batch[LeRobotFeatureKey.ACTION]
+    if actions.ndim != 3:
+        raise ValueError(
+            "ACT training needs chunked actions with shape [batch, chunk_size, action_dim]. "
+            "Build the LeRobotDataset with ACT delta_timestamps."
+        )
+
+    action_is_pad = batch.get(LeRobotFeatureKey.ACTION_IS_PAD)
+    action_mask = None if action_is_pad is None else ~action_is_pad.bool()
+    if norm_stats is not None:
+        qpos = normalize_tensor(qpos.float(), norm_stats[LeRobotFeatureKey.OBSERVATION_STATE])
+        actions = normalize_tensor(actions.float(), norm_stats[LeRobotFeatureKey.ACTION])
+    return images, qpos, actions, action_mask
+
+
+def set_warmup_lr(optimizer, base_lr: float, step: int, warmup_steps: int) -> None:
+    if warmup_steps <= 0:
+        lr = base_lr
+    else:
+        lr = base_lr * min(1.0, step / warmup_steps)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+def compute_loss(model, batch, device, camera_names, norm_stats, kl_weight: float):
+    images, qpos, actions, action_mask = unpack_lerobot_batch(batch, camera_names, norm_stats=norm_stats)
+    images = images.to(device)
+    qpos = qpos.to(device)
+    actions = actions.to(device)
+    if action_mask is not None:
+        action_mask = action_mask.to(device)
+
+    pred_actions, mu, log_var = model(images, qpos, actions, action_mask=action_mask)
+    action_error = F.l1_loss(pred_actions, actions, reduction="none")
+    if action_mask is not None:
+        action_error = action_error * action_mask.unsqueeze(-1)
+        action_loss = action_error.sum() / (action_mask.sum() * actions.shape[-1]).clamp_min(1.0)
+    else:
+        action_loss = action_error.mean()
+    kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+    return action_loss + kl_weight * kl_loss
+
+
+def train_step(model, batch, optimizer, device, camera_names, norm_stats, kl_weight: float, grad_clip: float) -> float:
+    model.train()
+    optimizer.zero_grad()
+    loss = compute_loss(model, batch, device, camera_names, norm_stats, kl_weight)
+    loss.backward()
+    if grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    return loss.item()
+
+
+def evaluate(model, dataloader, device, camera_names, norm_stats, kl_weight: float) -> float:
+    model.eval()
+    total_loss = 0.0
+    total_examples = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            loss = compute_loss(model, batch, device, camera_names, norm_stats, kl_weight)
+            batch_size = batch[LeRobotFeatureKey.OBSERVATION_STATE].shape[0]
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
+    return total_loss / max(total_examples, 1)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the custom OMX ACT model from a named experiment profile.")
+    parser.add_argument("--profile", default="pour_water", help="Experiment profile in configs/act/<profile>.py")
+    parser.add_argument("--run-name", default=None, help="Optional fixed run directory name under the profile job.")
+    parser.add_argument("--dry-run", action="store_true", help="Load config/data/model and write config without training.")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(profile=args.profile, run_name=args.run_name, dry_run=args.dry_run)
