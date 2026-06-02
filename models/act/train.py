@@ -1,12 +1,14 @@
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from enum import StrEnum
 import importlib
 import json
+import os
 from itertools import cycle
 from pathlib import Path
 import random
+import time
 
 import torch
 import torch.nn.functional as F
@@ -44,6 +46,12 @@ def resolve_dataset_root(config: ACTConfig) -> Path:
     )
 
 
+def describe_dataset(config: ACTConfig) -> str:
+    if config.dataset_format == "act_hdf5":
+        return f"{config.benchmark_task_name}:{config.benchmark_dataset_dir}"
+    return f"{config.dataset_repo_id}@{config.dataset_revision}"
+
+
 def create_run_dir(config: ACTConfig, run_name: str | None = None) -> Path:
     run_id = run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(config.output_root) / config.job_name / run_id
@@ -77,17 +85,71 @@ def save_checkpoint(
     }
     step_path = run_dir / f"checkpoint_step_{step:06d}.pt"
     torch.save(checkpoint, step_path)
-    torch.save(checkpoint, run_dir / "checkpoint_last.pt")
+    last_path = run_dir / "checkpoint_last.pt"
+    if last_path.exists():
+        last_path.unlink()
+    try:
+        os.link(step_path, last_path)
+    except OSError:
+        torch.save(checkpoint, last_path)
+
+
+def append_metrics(run_dir: Path, metrics: dict) -> None:
+    with (run_dir / "metrics.jsonl").open("a") as file:
+        file.write(json.dumps(metrics, sort_keys=True) + "\n")
+
+
+def current_lr(optimizer) -> float:
+    return optimizer.param_groups[0]["lr"]
+
+
+def cuda_memory_metrics(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda":
+        return {}
+    return {
+        "cuda_mem_allocated_gb": torch.cuda.memory_allocated(device) / 1e9,
+        "cuda_mem_reserved_gb": torch.cuda.memory_reserved(device) / 1e9,
+        "cuda_max_mem_allocated_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+    }
+
+
+def format_metrics(metrics: dict) -> str:
+    ordered_keys = [
+        "step",
+        "split",
+        "total_loss",
+        "action_l1_loss",
+        "kl_loss",
+        "weighted_kl_loss",
+        "lr",
+        "grad_norm",
+        "step_seconds",
+        "examples_per_second",
+        "action_valid_fraction",
+        "cuda_mem_allocated_gb",
+        "cuda_max_mem_allocated_gb",
+    ]
+    parts = []
+    for key in ordered_keys:
+        value = metrics.get(key)
+        if value is None:
+            continue
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.6g}")
+        else:
+            parts.append(f"{key}={value}")
+    return " ".join(parts)
 
 
 def main(profile: str = "pour_water", run_name: str | None = None, dry_run: bool = False):
     config = load_experiment(profile)
+    if dry_run and config.num_workers > 0:
+        config = replace(config, num_workers=0)
     torch.manual_seed(config.seed)
     random.seed(config.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    dataset_root = resolve_dataset_root(config)
-    train_loader, val_loader, norm_stats = make_lerobot_dataloaders(config, dataset_root, device)
+    train_loader, val_loader, norm_stats = make_dataloaders(config, device)
     sample_batch = next(iter(train_loader))
     _, qpos, actions, _ = unpack_lerobot_batch(sample_batch, config.camera_names, norm_stats=None)
 
@@ -113,7 +175,7 @@ def main(profile: str = "pour_water", run_name: str | None = None, dry_run: bool
     run_dir = create_run_dir(config, run_name)
     save_config(run_dir, profile, config)
     print(f"Profile: {profile}")
-    print(f"Dataset: {config.dataset_repo_id}@{config.dataset_revision}")
+    print(f"Dataset: {describe_dataset(config)}")
     print(f"Cameras: {config.camera_names}")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {0 if val_loader is None else len(val_loader)}")
@@ -123,12 +185,13 @@ def main(profile: str = "pour_water", run_name: str | None = None, dry_run: bool
         return
 
     train_iter = cycle(train_loader)
-    last_train_loss = float("nan")
-    last_val_loss = None
+    last_train_metrics = {"total_loss": float("nan")}
+    last_val_metrics = None
     for step in range(1, config.num_train_steps + 1):
         set_warmup_lr(optimizer, config.learning_rate, step, config.warmup_steps)
         batch = next(train_iter)
-        last_train_loss = train_step(
+        step_start = time.perf_counter()
+        last_train_metrics = train_step(
             model,
             batch,
             optimizer,
@@ -138,17 +201,53 @@ def main(profile: str = "pour_water", run_name: str | None = None, dry_run: bool
             config.kl_weight,
             config.grad_clip,
         )
+        step_seconds = time.perf_counter() - step_start
+        batch_size = batch[LeRobotFeatureKey.OBSERVATION_STATE].shape[0]
+        train_log = {
+            "step": step,
+            "split": "train",
+            **last_train_metrics,
+            "lr": current_lr(optimizer),
+            "step_seconds": step_seconds,
+            "examples_per_second": batch_size / max(step_seconds, 1e-9),
+            **cuda_memory_metrics(device),
+        }
 
         should_eval = val_loader is not None and (step % config.eval_freq == 0 or step == config.num_train_steps)
         if should_eval:
-            last_val_loss = evaluate(model, val_loader, device, config.camera_names, norm_stats, config.kl_weight)
-            print(f"Step {step}: train_loss={last_train_loss:.4f} val_loss={last_val_loss:.4f}")
-        elif step % config.eval_freq == 0 or step == 1:
-            print(f"Step {step}: train_loss={last_train_loss:.4f}")
+            last_val_metrics = evaluate(model, val_loader, device, config.camera_names, norm_stats, config.kl_weight)
+            val_log = {"step": step, "split": "val", **last_val_metrics}
+            append_metrics(run_dir, train_log)
+            append_metrics(run_dir, val_log)
+            print(format_metrics(train_log), flush=True)
+            print(format_metrics(val_log), flush=True)
+        elif step % config.log_freq == 0 or step == 1:
+            append_metrics(run_dir, train_log)
+            print(format_metrics(train_log), flush=True)
 
         should_save = step % config.save_freq == 0 or step == config.num_train_steps
         if should_save:
-            save_checkpoint(run_dir, step, model, optimizer, last_train_loss, last_val_loss, config, norm_stats)
+            save_checkpoint(
+                run_dir,
+                step,
+                model,
+                optimizer,
+                last_train_metrics["total_loss"],
+                None if last_val_metrics is None else last_val_metrics["total_loss"],
+                config,
+                norm_stats,
+            )
+            print(f"saved_checkpoint step={step} path={run_dir / f'checkpoint_step_{step:06d}.pt'}", flush=True)
+
+
+def make_dataloaders(config: ACTConfig, device: torch.device):
+    if config.dataset_format == "lerobot":
+        return make_lerobot_dataloaders(config, resolve_dataset_root(config), device)
+    if config.dataset_format == "act_hdf5":
+        from benchmarks.act_sim.dataset import make_act_hdf5_dataloaders
+
+        return make_act_hdf5_dataloaders(config, device)
+    raise ValueError(f"Unsupported dataset_format={config.dataset_format!r}")
 
 
 def make_lerobot_dataloaders(config: ACTConfig, root: Path, device: torch.device):
@@ -308,34 +407,55 @@ def compute_loss(model, batch, device, camera_names, norm_stats, kl_weight: floa
     if action_mask is not None:
         action_error = action_error * action_mask.unsqueeze(-1)
         action_loss = action_error.sum() / (action_mask.sum() * actions.shape[-1]).clamp_min(1.0)
+        action_valid_fraction = action_mask.float().mean()
     else:
         action_loss = action_error.mean()
+        action_valid_fraction = torch.ones((), device=device)
     kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
-    return action_loss + kl_weight * kl_loss
+    weighted_kl_loss = kl_weight * kl_loss
+    total_loss = action_loss + weighted_kl_loss
+    metrics = {
+        "total_loss": total_loss.detach().item(),
+        "action_l1_loss": action_loss.detach().item(),
+        "kl_loss": kl_loss.detach().item(),
+        "weighted_kl_loss": weighted_kl_loss.detach().item(),
+        "action_valid_fraction": action_valid_fraction.detach().item(),
+        "pred_action_mean": pred_actions.detach().mean().item(),
+        "pred_action_std": pred_actions.detach().std().item(),
+        "target_action_mean": actions.detach().mean().item(),
+        "target_action_std": actions.detach().std().item(),
+        "posterior_mu_abs_mean": mu.detach().abs().mean().item(),
+        "posterior_log_var_mean": log_var.detach().mean().item(),
+    }
+    return total_loss, metrics
 
 
-def train_step(model, batch, optimizer, device, camera_names, norm_stats, kl_weight: float, grad_clip: float) -> float:
+def train_step(model, batch, optimizer, device, camera_names, norm_stats, kl_weight: float, grad_clip: float) -> dict[str, float]:
     model.train()
     optimizer.zero_grad()
-    loss = compute_loss(model, batch, device, camera_names, norm_stats, kl_weight)
+    loss, metrics = compute_loss(model, batch, device, camera_names, norm_stats, kl_weight)
     loss.backward()
+    grad_norm = None
     if grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
-    return loss.item()
+    if grad_norm is not None:
+        metrics["grad_norm"] = float(grad_norm.detach().cpu())
+    return metrics
 
 
-def evaluate(model, dataloader, device, camera_names, norm_stats, kl_weight: float) -> float:
+def evaluate(model, dataloader, device, camera_names, norm_stats, kl_weight: float) -> dict[str, float]:
     model.eval()
-    total_loss = 0.0
+    totals = {}
     total_examples = 0
     with torch.no_grad():
         for batch in dataloader:
-            loss = compute_loss(model, batch, device, camera_names, norm_stats, kl_weight)
             batch_size = batch[LeRobotFeatureKey.OBSERVATION_STATE].shape[0]
-            total_loss += loss.item() * batch_size
+            _, metrics = compute_loss(model, batch, device, camera_names, norm_stats, kl_weight)
+            for key, value in metrics.items():
+                totals[key] = totals.get(key, 0.0) + value * batch_size
             total_examples += batch_size
-    return total_loss / max(total_examples, 1)
+    return {key: value / max(total_examples, 1) for key, value in totals.items()}
 
 
 def parse_args() -> argparse.Namespace:

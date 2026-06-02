@@ -2,8 +2,11 @@
 Train the custom models/act ACT implementation on Modal.
 
 Usage:
-    modal run deploy/train_custom_act_modal.py --profile pour_water
-    modal run deploy/train_custom_act_modal.py --profile pour_water_fast --run-name smoke-modal
+    modal run --detach deploy/train_custom_act_modal.py::train_remote --profile pour_water
+    modal run deploy/train_custom_act_modal.py --profile pour_water --preflight-only
+    modal run deploy/train_custom_act_modal.py --profile sim_transfer_cube_reference \
+      --benchmark-dataset-dir data/benchmarks/act_sim_transfer_cube_scripted --upload-benchmark-data
+    modal run deploy/train_custom_act_modal.py --profile sim_transfer_cube_reference --run-name seed0
 
 Download outputs:
     modal volume get omx-custom-act-training-logs / outputs/modal_custom_act
@@ -20,7 +23,8 @@ import modal
 
 REMOTE_WORKSPACE = Path("/workspace")
 REMOTE_OUTPUTS = Path("/outputs")
-MODAL_GPU = "A100-80GB"
+REMOTE_BENCHMARK_DATA = Path("/benchmark-data")
+MODAL_GPU = "A10G"
 
 hf_secret = modal.Secret.from_name("huggingface")
 
@@ -34,8 +38,9 @@ image = (
     )
     .pip_install(
         "huggingface-hub>=1.0,<2.0",
-        "lerobot[dynamixel]>=0.5.1",
+        "lerobot>=0.5.1",
         "av>=15,<16",
+        "h5py>=3.15",
         "pandas",
         "pyarrow",
         "safetensors",
@@ -43,10 +48,12 @@ image = (
     .add_local_dir("models", remote_path=str(REMOTE_WORKSPACE / "models"))
     .add_local_dir("configs", remote_path=str(REMOTE_WORKSPACE / "configs"))
     .add_local_dir("utils", remote_path=str(REMOTE_WORKSPACE / "utils"))
+    .add_local_dir("benchmarks", remote_path=str(REMOTE_WORKSPACE / "benchmarks"))
 )
 
 app = modal.App("omx-custom-act-training", image=image)
 vol = modal.Volume.from_name("omx-custom-act-training-logs", create_if_missing=True)
+benchmark_vol = modal.Volume.from_name("omx-custom-act-benchmark-data", create_if_missing=True)
 
 
 def load_profile(profile: str):
@@ -55,12 +62,17 @@ def load_profile(profile: str):
 
 
 def preflight_profile(profile: str) -> None:
-    from huggingface_hub import HfApi
-
     config = load_profile(profile)
     print(f"PROFILE {profile}")
     print(f"  modal_gpu={MODAL_GPU}")
-    print(f"  dataset={config.dataset_repo_id}@{config.dataset_revision}")
+    print(f"  dataset_format={config.dataset_format}")
+    if config.dataset_format == "act_hdf5":
+        print(f"  benchmark_task={config.benchmark_task_name}")
+        print(f"  benchmark_dataset_dir={config.benchmark_dataset_dir}")
+        print(f"  benchmark_num_episodes={config.benchmark_num_episodes}")
+        print(f"  benchmark_episode_len={config.benchmark_episode_len}")
+    else:
+        print(f"  dataset={config.dataset_repo_id}@{config.dataset_revision}")
     print(f"  cameras={config.camera_names}")
     print(f"  batch_size={config.batch_size}")
     print(f"  chunk_size={config.chunk_size}")
@@ -71,14 +83,66 @@ def preflight_profile(profile: str) -> None:
     print(f"  kl_weight={config.kl_weight}")
     print(f"  steps={config.num_train_steps}")
 
-    HfApi().dataset_info(config.dataset_repo_id, revision=config.dataset_revision)
+    if config.dataset_format == "act_hdf5":
+        print("  dataset_check=skipped; benchmark HDF5 data is staged in Modal volume")
+    else:
+        try:
+            from huggingface_hub import HfApi
+        except ModuleNotFoundError:
+            print("  dataset_check=skipped; install/use uv env for local huggingface_hub preflight")
+        else:
+            HfApi().dataset_info(config.dataset_repo_id, revision=config.dataset_revision)
+            print("  dataset_check=ok")
+
+
+def benchmark_remote_dir(profile: str) -> Path:
+    return REMOTE_BENCHMARK_DATA / profile
+
+
+def upload_benchmark_dataset(profile: str, local_dataset_dir: str) -> None:
+    local_path = Path(local_dataset_dir).expanduser()
+    if not local_path.is_dir():
+        raise FileNotFoundError(f"Benchmark dataset dir not found: {local_path}")
+    episode_files = sorted(local_path.glob("episode_*.hdf5"))
+    if not episode_files:
+        raise FileNotFoundError(f"No episode_*.hdf5 files found in {local_path}")
+
+    remote_dir = f"/{profile}"
+    print(f"Uploading {len(episode_files)} benchmark episodes to Modal volume {remote_dir}...")
+    with benchmark_vol.batch_upload(force=True) as batch:
+        batch.put_directory(local_path, remote_dir)
+    print("Benchmark upload complete.")
+
+
+@app.function(volumes={REMOTE_BENCHMARK_DATA: benchmark_vol})
+def list_benchmark_data(profile: str) -> list[str]:
+    import os
+
+    benchmark_vol.reload()
+    root_dir = benchmark_remote_dir(profile)
+    results = []
+    if not root_dir.exists():
+        return results
+    for root, _dirs, files in os.walk(root_dir):
+        for filename in files:
+            full = os.path.join(root, filename)
+            results.append(os.path.relpath(full, root_dir))
+    return sorted(results)
+
+
+def configure_remote_profile(config, profile: str):
+    remote_output_root = REMOTE_OUTPUTS / "act_experiments"
+    updated = replace(config, output_root=str(remote_output_root))
+    if updated.dataset_format == "act_hdf5":
+        updated = replace(updated, benchmark_dataset_dir=str(benchmark_remote_dir(profile)))
+    return updated
 
 
 @app.function(
     gpu=MODAL_GPU,
     timeout=86_400,
     memory=65_536,
-    volumes={REMOTE_OUTPUTS: vol},
+    volumes={REMOTE_OUTPUTS: vol, REMOTE_BENCHMARK_DATA: benchmark_vol},
     secrets=[hf_secret],
 )
 def train_remote(profile: str, run_name: str | None = None) -> str:
@@ -103,8 +167,22 @@ def train_remote(profile: str, run_name: str | None = None) -> str:
     print("VRAM (GB):", round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1))
 
     config_module = importlib.import_module(f"configs.act.{profile}")
-    remote_output_root = REMOTE_OUTPUTS / "act_experiments"
-    config_module.config = replace(config_module.config, output_root=str(remote_output_root))
+    config_module.config = configure_remote_profile(config_module.config, profile)
+    if config_module.config.dataset_format == "act_hdf5":
+        benchmark_vol.reload()
+        dataset_dir = Path(config_module.config.benchmark_dataset_dir)
+        episode_files = sorted(dataset_dir.glob("episode_*.hdf5"))
+        expected = config_module.config.benchmark_num_episodes
+        print(f"benchmark_dataset_dir={dataset_dir}")
+        print(f"benchmark_episode_files={len(episode_files)}")
+        if expected is not None and len(episode_files) != expected:
+            raise RuntimeError(f"Expected {expected} benchmark episodes in {dataset_dir}, found {len(episode_files)}")
+        if not episode_files:
+            raise RuntimeError(
+                f"No benchmark episodes found in {dataset_dir}. "
+                "Run the local entrypoint with --upload-benchmark-data first."
+            )
+    remote_output_root = Path(config_module.config.output_root)
 
     from models.act.train import main as train_main
 
@@ -133,10 +211,35 @@ def list_outputs() -> list[str]:
 
 
 @app.local_entrypoint()
-def main(profile: str = "pour_water", run_name: str | None = None, preflight_only: bool = False):
+def main(
+    profile: str = "pour_water",
+    run_name: str | None = None,
+    preflight_only: bool = False,
+    benchmark_dataset_dir: str | None = None,
+    upload_benchmark_data: bool = False,
+    list_benchmark_only: bool = False,
+):
     preflight_profile(profile)
+    config = load_profile(profile)
+    if upload_benchmark_data:
+        if config.dataset_format != "act_hdf5":
+            raise ValueError("--upload-benchmark-data is only valid for dataset_format='act_hdf5' profiles")
+        upload_benchmark_dataset(profile, benchmark_dataset_dir or config.benchmark_dataset_dir or "")
+    if list_benchmark_only:
+        files = list_benchmark_data.remote(profile)
+        print(f"Benchmark files in Modal volume for {profile}:")
+        for filename in files[:20]:
+            print(f"  {filename}")
+        if len(files) > 20:
+            print(f"  ... {len(files) - 20} more")
+        return
     if preflight_only:
         print("Preflight only; not launching Modal GPU job.")
+        return
+    if upload_benchmark_data:
+        print("Benchmark upload complete; not launching Modal GPU job.")
+        print("Start training with:")
+        print(f"  modal run deploy/train_custom_act_modal.py --profile {profile} --run-name {run_name or 'seed0'}")
         return
 
     function_call = train_remote.spawn(profile, run_name)

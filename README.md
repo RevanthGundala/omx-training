@@ -128,6 +128,44 @@ To also run a real 1-step local training smoke test:
 uv run python -m tests.smoke_test --train-step
 ```
 
+### 8. ACT sim_transfer_cube benchmark
+
+Use this path to check the custom `models/act` implementation against the
+original ACT MuJoCo benchmark, not to simulate OMX.
+
+Generate official ACT HDF5 demos from a checkout of
+`https://github.com/tonyzhaozh/act`:
+
+```bash
+export ACT_REPO_DIR=/path/to/act
+uv run python -m benchmarks.act_sim.generate \
+  --dataset-dir data/benchmarks/act_sim_transfer_cube_scripted \
+  --episodes 50
+```
+
+Then run the custom ACT trainer on the benchmark data:
+
+```bash
+uv run python -m models.act.train --profile sim_transfer_cube_reference --run-name seed0
+```
+
+To run the same reference profile on Modal, upload the downloaded/generated HDF5
+episodes once, then launch training:
+
+```bash
+uv run modal run deploy/train_custom_act_modal.py --profile sim_transfer_cube_reference \
+  --benchmark-dataset-dir data/benchmarks/act_sim_transfer_cube_scripted \
+  --upload-benchmark-data
+uv run modal run deploy/train_custom_act_modal.py --profile sim_transfer_cube_reference --run-name seed0
+```
+
+For a small wiring check, generate two episodes into
+`data/benchmarks/act_sim_transfer_cube_smoke` and run:
+
+```bash
+uv run python -m models.act.train --profile sim_transfer_cube_smoke --dry-run
+```
+
 ## Configuration
 
 Each script has a **Configuration** section at the top of the file. Shared

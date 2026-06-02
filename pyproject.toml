@@ -12,6 +12,7 @@ dependencies = [
     "modal>=1.4.1",
     "ultralytics>=8.3",
     "transformers>=5.9.0",
+    "h5py>=3.15",
 ]
 
 [build-system]

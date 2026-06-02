@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 outputs/
+data/benchmarks/
 episodes_h264/
 *.mp4
 *.png
